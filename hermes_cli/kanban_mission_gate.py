@@ -11,11 +11,11 @@ before writing (fail-closed: an unknown status, unknown transition, or a
 transition not permitted from the current status is REJECTED, never
 silently allowed).
 
-Scope guard (Phase 1): this gate defines the *transition model*. It does
-NOT implement auto-remediation, auto-re-review, or next-package creation.
-Those orchestration actions arrive in a later phase; the gate only makes
-the legal transitions deterministic and observable so a future phase can
-drive them without guessing.
+Scope: this gate defines the *transition model*. The kernel drives the
+lifecycle: auto-remediation (`rework`), auto-re-review, and next-package
+progression (`advance` when a PASS has a following package; `complete` when
+the sequence ends). This module only makes the legal transitions
+deterministic and observable so the kernel can drive them without guessing.
 
 Lifecycle (mission-level, deliberately small and deterministic):
 
@@ -26,10 +26,9 @@ Lifecycle (mission-level, deliberately small and deterministic):
       |                      |                | complete        | rework (REVIEW_FAIL)
       |                      |                v                 v
       |                    done  <--------  (complete)   in_progress (loop)
-      |                                        
-      |                      in_progress / in_review  --block-->  blocked
-      |                                                              |
-      +---------------------- unblock/start -------------------------+
+      |                                (advance: PASS, next pkg)  |
+      |                                                           |
+      +---------------------- unblock/start ---------------------+
 
 `waiting_for` names the precondition the mission is currently awaiting
 (which actor/decision unlocks progress). `next_transition` names the single
@@ -74,8 +73,9 @@ TERMINAL_STATUSES: FrozenSet[str] = frozenset({STATUS_DONE})
 
 TR_START = "start"                # planned -> in_progress
 TR_REQUEST_REVIEW = "request_review"  # in_progress -> in_review
-TR_COMPLETE = "complete"          # in_review -> done (REVIEW_PASS)
-TR_REWORK = "rework"              # in_review -> in_progress (REVIEW_FAIL)
+TR_COMPLETE = "complete"          # in_review -> done (REVIEW_PASS, sequence end)
+TR_REWORK = "rework"              # in_review -> in_progress (REVIEW_FAIL loop)
+TR_ADVANCE = "advance"            # in_review -> in_progress (REVIEW_PASS, next package)
 TR_BLOCK = "block"                # in_progress|in_review -> blocked
 TR_UNBLOCK = "unblock"            # blocked -> in_progress
 TR_ABANDON = "abandon"            # blocked/planned -> done (terminal, human)
@@ -85,6 +85,7 @@ VALID_TRANSITIONS: FrozenSet[str] = frozenset({
     TR_REQUEST_REVIEW,
     TR_COMPLETE,
     TR_REWORK,
+    TR_ADVANCE,
     TR_BLOCK,
     TR_UNBLOCK,
     TR_ABANDON,
@@ -141,8 +142,10 @@ MISSION_PHASES: Dict[str, MissionPhase] = {
     STATUS_IN_REVIEW: MissionPhase(
         status=STATUS_IN_REVIEW,
         waiting_for=WAIT_REVIEW_DECISION,
-        next_transition=TR_COMPLETE,  # canonical happy-path next; rework also legal
-        allowed_transitions=frozenset({TR_COMPLETE, TR_REWORK, TR_BLOCK, TR_ABANDON}),
+        next_transition=TR_COMPLETE,  # canonical happy-path next; rework/advance also legal
+        allowed_transitions=frozenset({
+            TR_COMPLETE, TR_REWORK, TR_ADVANCE, TR_BLOCK, TR_ABANDON,
+        }),
     ),
     STATUS_BLOCKED: MissionPhase(
         status=STATUS_BLOCKED,
@@ -166,6 +169,7 @@ TRANSITION_RESOLUTION: Dict[str, Tuple[str, str]] = {
     TR_REQUEST_REVIEW: (STATUS_IN_PROGRESS, STATUS_IN_REVIEW),
     TR_COMPLETE: (STATUS_IN_REVIEW, STATUS_DONE),
     TR_REWORK: (STATUS_IN_REVIEW, STATUS_IN_PROGRESS),
+    TR_ADVANCE: (STATUS_IN_REVIEW, STATUS_IN_PROGRESS),
     TR_BLOCK: (None, STATUS_BLOCKED),   # from in_progress or in_review
     TR_UNBLOCK: (STATUS_BLOCKED, STATUS_IN_PROGRESS),
     TR_ABANDON: (None, STATUS_DONE),    # from planned, in_progress, in_review, blocked
