@@ -136,6 +136,15 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Mission REVIEW_FAIL loop-cap (Phase 2). A mission-scoped task that keeps
+# coming back with `changes_requested` auto-remediates (mission
+# `in_review -> in_progress` via `rework`) up to this many times. When a new
+# request_changes would push `remediation_count` above this limit, the kernel
+# stops auto-remediating and instead blocks the mission (fail-closed) so a
+# repeating REVIEW_FAIL cannot spin the mission forever — mirroring the
+# BLOCK_RECURRENCE_LIMIT spirit but counting mission rework cycles.
+MISSION_REMEDIATION_LIMIT = 3
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1266,6 +1275,7 @@ class Mission:
     origin_session: Optional[str]
     created_at: int
     updated_at: int
+    remediation_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Mission":
@@ -1277,6 +1287,12 @@ class Mission:
             next_transition=row["next_transition"],
             current_package=row["current_package"],
             origin_session=row["origin_session"],
+            remediation_count=(
+                int(row["remediation_count"])
+                if "remediation_count" in row.keys()
+                and row["remediation_count"] is not None
+                else 0
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1483,8 +1499,28 @@ CREATE TABLE IF NOT EXISTS missions (
     next_transition   TEXT NOT NULL,
     current_package   TEXT,
     origin_session    TEXT,
+    -- REVIEW_FAIL loop-cap (Phase 2): number of `rework` remediations the
+    -- mission has undergone. When it exceeds MISSION_REMEDIATION_LIMIT the
+    -- kernel blocks the mission instead of auto-remediating again, so a
+    -- repeating REVIEW_FAIL cannot spin the mission forever.
+    remediation_count INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
+);
+
+-- Deterministic, ordered package sequence for a mission (Phase 2). The
+-- kernel advances `seq` deterministically on package PASS (never by model
+-- decision). `task_id` links a package row to its created task; NULL until
+-- the package's task exists. Strictly sequential — no skipping/parallel.
+CREATE TABLE IF NOT EXISTS mission_packages (
+    mission_id   TEXT NOT NULL,
+    seq          INTEGER NOT NULL,     -- 1-based package order
+    title        TEXT NOT NULL,
+    status       TEXT NOT NULL,        -- pending | in_progress | done | blocked
+    task_id      TEXT,                 -- linked task (once created)
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (mission_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2774,6 +2810,36 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Mission-scoped task. NULL = not mission-scoped (existing behaviour).
         _add_column_if_missing(conn, "tasks", "mission_id", "mission_id TEXT")
 
+    # ── Phase 2: remediation loop-cap + deterministic package sequence ─────
+    # remediation_count on missions (REVIEW_FAIL loop-cap). Additive; legacy
+    # missions get the DEFAULT 0 (no auto-remediation loop-cap history).
+    _add_column_if_missing(
+        conn, "missions", "remediation_count",
+        "remediation_count INTEGER NOT NULL DEFAULT 0",
+    )
+    # Ordered package sequence per mission. Created idempotently for legacy
+    # boards that predate Phase 2 (SCHEMA_SQL only ran on the original init).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mission_packages (
+            mission_id   TEXT NOT NULL,
+            seq          INTEGER NOT NULL,
+            title        TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            task_id      TEXT,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            PRIMARY KEY (mission_id, seq)
+        )
+        """
+    )
+    # Indexes over additive mission columns must be created after the
+    # columns/table exist (same ordering rule as above).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mission_packages_mission "
+        "ON mission_packages(mission_id)"
+    )
+
     # Indexes over additive mission columns must be created after the
     # columns/table exist (same ordering rule as the additive indexes above:
     # SCHEMA_SQL's executescript would abort on a missing column for legacy
@@ -3762,7 +3828,7 @@ def get_mission(
     """Return the mission row, or None if not found."""
     row = conn.execute(
         "SELECT id, title, status, waiting_for, next_transition, current_package, "
-        "       origin_session, created_at, updated_at "
+        "       origin_session, remediation_count, created_at, updated_at "
         "FROM missions WHERE id = ?",
         (mission_id,),
     ).fetchone()
@@ -3793,7 +3859,7 @@ def list_missions(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"SELECT id, title, status, waiting_for, next_transition, current_package, "
-        f"       origin_session, created_at, updated_at "
+        f"       origin_session, remediation_count, created_at, updated_at "
         f"FROM missions {where} ORDER BY created_at ASC",
         params,
     ).fetchall()
@@ -3826,37 +3892,60 @@ def transition_mission(
     """
     now = int(time.time())
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM missions WHERE id = ?",
-            (mission_id,),
-        ).fetchone()
-        if row is None:
-            return False, "mission not found"
-        current = row["status"]
-        if expected_status is not None and current != expected_status:
-            return (
-                False,
-                f"mission status changed concurrently: expected {expected_status!r}, "
-                f"actual {current!r}",
-            )
-        try:
-            new_status = _mission_gate.resolve_transition(current, transition)
-        except ValueError as exc:
-            return False, str(exc)
-        cur = conn.execute(
-            "UPDATE missions "
-            "SET status = ?, waiting_for = ?, next_transition = ?, updated_at = ? "
-            "WHERE id = ?",
-            (
-                new_status,
-                _mission_gate.expected_waiting_for(new_status),
-                _mission_gate.expected_next_transition(new_status),
-                now,
-                mission_id,
-            ),
+        return _transition_mission_locked(
+            conn, mission_id, transition,
+            expected_status=expected_status, now=now,
         )
-        if cur.rowcount != 1:
-            return False, "mission update failed (concurrent writer)"
+
+
+def _transition_mission_locked(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    transition: str,
+    *,
+    expected_status: Optional[str],
+    now: int,
+) -> tuple[bool, str]:
+    """Apply a mission transition inside an ALREADY-OPEN write transaction.
+
+    Same fail-closed, CAS-guarded semantics as :func:`transition_mission`
+    but WITHOUT its own ``write_txn`` wrapper, so kernel hooks that run
+    inside their own transaction (``request_changes``, ``complete_task``,
+    ``request_review``) can drive the mission atomically with the task
+    transition. The caller owns the transaction; ``expected_status`` is
+    still verified against a fresh read under the same IMMEDIATE lock.
+    """
+    row = conn.execute(
+        "SELECT status FROM missions WHERE id = ?",
+        (mission_id,),
+    ).fetchone()
+    if row is None:
+        return False, "mission not found"
+    current = row["status"]
+    if expected_status is not None and current != expected_status:
+        return (
+            False,
+            f"mission status changed concurrently: expected {expected_status!r}, "
+            f"actual {current!r}",
+        )
+    try:
+        new_status = _mission_gate.resolve_transition(current, transition)
+    except ValueError as exc:
+        return False, str(exc)
+    cur = conn.execute(
+        "UPDATE missions "
+        "SET status = ?, waiting_for = ?, next_transition = ?, updated_at = ? "
+        "WHERE id = ?",
+        (
+            new_status,
+            _mission_gate.expected_waiting_for(new_status),
+            _mission_gate.expected_next_transition(new_status),
+            now,
+            mission_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        return False, "mission update failed (concurrent writer)"
     return True, new_status
 
 
@@ -3879,6 +3968,191 @@ def set_mission_current_package(
             (task_id, int(time.time()), mission_id),
         )
         return cur.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Mission package sequence (Phase 2) — deterministic, strictly sequential
+# ---------------------------------------------------------------------------
+
+_PKG_PENDING = "pending"
+_PKG_IN_PROGRESS = "in_progress"
+_PKG_DONE = "done"
+_PKG_BLOCKED = "blocked"
+_VALID_PKG_STATUSES = frozenset(
+    {_PKG_PENDING, _PKG_IN_PROGRESS, _PKG_DONE, _PKG_BLOCKED}
+)
+
+
+def add_mission_package(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    title: str,
+    *,
+    seq: Optional[int] = None,
+    board: Optional[str] = None,
+) -> int:
+    """Add a package to a mission's deterministic sequence; return its seq.
+
+    ``seq`` defaults to the next sequential integer for the mission (the
+    highest existing ``seq`` + 1, or 1 for the first). Each package starts
+    ``pending`` with no linked task. Fail-closed: an unknown ``status`` is
+    rejected, an unknown mission is rejected, and a duplicate ``seq`` raises
+    (PK conflict) so a package can never be added twice.
+    """
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("package title is required")
+    if get_mission(conn, mission_id) is None:
+        raise ValueError(f"mission {mission_id!r} does not exist")
+    with write_txn(conn):
+        if seq is None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM mission_packages "
+                "WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()
+            seq = int(row["m"]) + 1
+        seq = int(seq)
+        if seq < 1:
+            raise ValueError("package seq must be >= 1")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO mission_packages "
+            "(mission_id, seq, title, status, task_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (mission_id, seq, title, _PKG_PENDING, None, now, now),
+        )
+    return seq
+
+
+def list_mission_packages(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    *,
+    board: Optional[str] = None,
+) -> list[dict]:
+    """Return all packages for ``mission_id`` ordered by ``seq`` ascending."""
+    rows = conn.execute(
+        "SELECT mission_id, seq, title, status, task_id, created_at, updated_at "
+        "FROM mission_packages WHERE mission_id = ? ORDER BY seq ASC",
+        (mission_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_current_mission_package(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict]:
+    """Return the package currently in progress for the mission, or None.
+
+    ``current_package`` on the mission row names the task; this resolves
+    back to its package row. If the mission has no ``current_package`` the
+    first ``in_progress`` package (else first ``pending``) is returned.
+    """
+    mission = get_mission(conn, mission_id)
+    if mission is None:
+        return None
+    if mission.current_package:
+        row = conn.execute(
+            "SELECT mission_id, seq, title, status, task_id, created_at, updated_at "
+            "FROM mission_packages WHERE mission_id = ? AND task_id = ?",
+            (mission_id, mission.current_package),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+    for status in (_PKG_IN_PROGRESS, _PKG_PENDING):
+        row = conn.execute(
+            "SELECT mission_id, seq, title, status, task_id, created_at, updated_at "
+            "FROM mission_packages WHERE mission_id = ? AND status = ? "
+            "ORDER BY seq ASC LIMIT 1",
+            (mission_id, status),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+    return None
+
+
+def next_mission_package(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    *,
+    current_seq: int,
+    board: Optional[str] = None,
+) -> Optional[dict]:
+    """Return the deterministic successor package after ``current_seq``.
+
+    Strictly sequential (Phase 2 scope): the successor is the package with
+    ``seq = current_seq + 1``; if it does not exist there is no next
+    package (the mission is at its sequence end). Never skips.
+    """
+    row = conn.execute(
+        "SELECT mission_id, seq, title, status, task_id, created_at, updated_at "
+        "FROM mission_packages WHERE mission_id = ? AND seq = ?",
+        (mission_id, int(current_seq) + 1),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def link_mission_package_task(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    seq: int,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Attach a created task to a package row and mark it in_progress.
+
+    Returns True when exactly one row updated. Fail-closed: unknown seq,
+    unknown task, or a package already linked to a different task leaves
+    the row unchanged.
+    """
+    task_row = conn.execute(
+        "SELECT id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task_row is None:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE mission_packages "
+            "SET status = ?, task_id = ?, updated_at = ? "
+            "WHERE mission_id = ? AND seq = ? AND (task_id IS NULL OR task_id = ?)",
+            (_PKG_IN_PROGRESS, task_id, int(time.time()), mission_id, int(seq), task_id),
+        )
+        return cur.rowcount == 1
+
+
+def _latest_review_implementer(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Recover the implementer from the latest ``review_requested`` event.
+
+    Used to deterministically assign the next package task to the SAME
+    implementer profile (the reviewer provenance route is symmetric). Returns
+    None when there is no review handoff — callers fail closed on that.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    implementer = payload.get("implementer")
+    if isinstance(implementer, str) and implementer.strip():
+        return implementer.strip()
+    return None
 
 
 def _inherit_notify_subs(
@@ -5739,10 +6013,11 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, mission_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        prior_mission_id = prior["mission_id"] if prior and prior["mission_id"] else None
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5853,6 +6128,80 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # ── Phase 2: deterministic next-package progression ────────────────
+        # Only when the completed task is a mission-scoped package, the mission
+        # is `in_review` (this completion was a review PASS), and the task is
+        # linked to a package row. On PASS with a following package: create +
+        # link the next task deterministically, advance `current_package`, and
+        # return the mission to `in_progress` (gate `advance`). At the sequence
+        # end: finish the current package and complete the mission (gate
+        # `complete`). Fail-closed: any other shape leaves the mission and
+        # package sequence untouched — no skipping, no parallel packages.
+        if prior_mission_id:
+            _mission = get_mission(conn, prior_mission_id)
+            if (
+                _mission is not None
+                and _mission.status == _mission_gate.STATUS_IN_REVIEW
+            ):
+                _pkg_row = conn.execute(
+                    "SELECT mission_id, seq, status FROM mission_packages "
+                    "WHERE mission_id = ? AND task_id = ?",
+                    (prior_mission_id, task_id),
+                ).fetchone()
+                if _pkg_row is not None:
+                    _now = int(time.time())
+                    _pkg_seq = int(_pkg_row["seq"])
+                    _nxt = next_mission_package(
+                        conn, prior_mission_id, current_seq=_pkg_seq
+                    )
+                    if _nxt is not None:
+                        conn.execute(
+                            "UPDATE mission_packages SET status = ?, updated_at = ? "
+                            "WHERE mission_id = ? AND seq = ?",
+                            (_PKG_DONE, _now, prior_mission_id, _pkg_seq),
+                        )
+                        _implementer = _latest_review_implementer(conn, task_id)
+                        _nxt_task_id = create_task(
+                            conn,
+                            title=_nxt["title"],
+                            body=(
+                                f"[mission:{prior_mission_id}] package "
+                                f"{int(_nxt['seq'])}"
+                            ),
+                            assignee=_implementer,
+                            mission_id=prior_mission_id,
+                            parents=[task_id],
+                            created_by=_implementer,
+                            session_id=_mission.origin_session,
+                        )
+                        conn.execute(
+                            "UPDATE mission_packages "
+                            "SET status = ?, task_id = ?, updated_at = ? "
+                            "WHERE mission_id = ? AND seq = ?",
+                            (
+                                _PKG_IN_PROGRESS, _nxt_task_id, _now,
+                                prior_mission_id, int(_nxt["seq"]),
+                            ),
+                        )
+                        conn.execute(
+                            "UPDATE missions SET current_package = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            (_nxt_task_id, _now, prior_mission_id),
+                        )
+                        _transition_mission_locked(
+                            conn, prior_mission_id, _mission_gate.TR_ADVANCE,
+                            expected_status=_mission_gate.STATUS_IN_REVIEW, now=_now,
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE mission_packages SET status = ?, updated_at = ? "
+                            "WHERE mission_id = ? AND seq = ?",
+                            (_PKG_DONE, _now, prior_mission_id, _pkg_seq),
+                        )
+                        _transition_mission_locked(
+                            conn, prior_mission_id, _mission_gate.TR_COMPLETE,
+                            expected_status=_mission_gate.STATUS_IN_REVIEW, now=_now,
+                        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6831,7 +7180,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, mission_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6950,6 +7299,30 @@ def request_review(
             },
             run_id=run_id,
         )
+        # Phase 2: a mission-scoped task entering the review lane drives the
+        # mission deterministically to `in_review` — start it if it is still
+        # `planned` (first package), otherwise advance `in_progress -> in_review`.
+        # Fail-closed: for any other mission status (already in_review, blocked,
+        # done) no transition is attempted — the mission is never double-driven.
+        _mission_id = trow["mission_id"] if trow["mission_id"] else None
+        if _mission_id:
+            _mission = get_mission(conn, _mission_id)
+            if _mission is not None:
+                _now = int(time.time())
+                if _mission.status == _mission_gate.STATUS_PLANNED:
+                    _transition_mission_locked(
+                        conn, _mission_id, _mission_gate.TR_START,
+                        expected_status=_mission_gate.STATUS_PLANNED, now=_now,
+                    )
+                    _transition_mission_locked(
+                        conn, _mission_id, _mission_gate.TR_REQUEST_REVIEW,
+                        expected_status=_mission_gate.STATUS_IN_PROGRESS, now=_now,
+                    )
+                elif _mission.status == _mission_gate.STATUS_IN_PROGRESS:
+                    _transition_mission_locked(
+                        conn, _mission_id, _mission_gate.TR_REQUEST_REVIEW,
+                        expected_status=_mission_gate.STATUS_IN_PROGRESS, now=_now,
+                    )
     return _ret(True)
 
 
@@ -6974,7 +7347,7 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, mission_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -7057,6 +7430,41 @@ def request_changes(
             status=new_status,
             summary=reason,
         )
+        # Phase 2: mission-scoped REVIEW_FAIL drives the mission
+        # deterministically `in_review -> in_progress` (rework) atomically with
+        # the task re-queue, subject to the remediation loop-cap. Once the
+        # mission's remediation_count exceeds MISSION_REMEDIATION_LIMIT,
+        # further changes_requested STOP auto-remediating and instead block the
+        # mission (fail-closed) so a repeating REVIEW_FAIL cannot spin forever.
+        # A mission that is already `blocked` is left blocked (no rework).
+        _mission_id = task_row["mission_id"] if task_row["mission_id"] else None
+        _loop_guard = False
+        if _mission_id:
+            _mission = get_mission(conn, _mission_id)
+            if _mission is not None:
+                _now = int(time.time())
+                if _mission.status == _mission_gate.STATUS_IN_REVIEW:
+                    _new_count = (_mission.remediation_count or 0) + 1
+                    conn.execute(
+                        "UPDATE missions SET remediation_count = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (_new_count, _now, _mission_id),
+                    )
+                    if _new_count > MISSION_REMEDIATION_LIMIT:
+                        _transition_mission_locked(
+                            conn, _mission_id, _mission_gate.TR_BLOCK,
+                            expected_status=_mission_gate.STATUS_IN_REVIEW, now=_now,
+                        )
+                        _loop_guard = True
+                    else:
+                        _transition_mission_locked(
+                            conn, _mission_id, _mission_gate.TR_REWORK,
+                            expected_status=_mission_gate.STATUS_IN_REVIEW, now=_now,
+                        )
+                elif _mission.status == _mission_gate.STATUS_BLOCKED:
+                    # Already blocked (e.g. hit the loop-cap earlier): no
+                    # re-transition — fail-closed. Task re-queue already done.
+                    _loop_guard = True
         _append_event(
             conn,
             task_id,
@@ -7066,6 +7474,7 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "loop_guard": _loop_guard,
             },
             run_id=run_id,
         )
