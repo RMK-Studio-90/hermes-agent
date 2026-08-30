@@ -82,6 +82,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import uuid
 import logging
 import time
 from contextvars import ContextVar, Token
@@ -90,6 +91,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_mission_gate as _mission_gate
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1141,6 +1143,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Mission-scoped progression link (Phase 1). When set, this task belongs
+    # to a ``missions`` row and its lifecycle is constrained by the mission's
+    # deterministic waiting_for / next_transition gate. None = free-standing
+    # task (legacy behaviour unchanged).
+    mission_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1242,43 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            mission_id=(
+                row["mission_id"] if "mission_id" in keys and row["mission_id"] else None
+            ),
+        )
+
+
+@dataclass
+class Mission:
+    """In-memory view of a ``missions`` row (Phase 1 persistent progression).
+
+    ``waiting_for`` and ``next_transition`` are deterministic, derived from
+    ``status`` via the mission transition gate — not free-text. The kernel
+    validates every persisted mission row against the gate (fail-closed).
+    """
+
+    id: str
+    title: str
+    status: str
+    waiting_for: str
+    next_transition: str
+    current_package: Optional[str]
+    origin_session: Optional[str]
+    created_at: int
+    updated_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Mission":
+        return cls(
+            id=row["id"],
+            title=row["title"],
+            status=row["status"],
+            waiting_for=row["waiting_for"],
+            next_transition=row["next_transition"],
+            current_package=row["current_package"],
+            origin_session=row["origin_session"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
 
@@ -1422,7 +1466,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Mission-scoped progression (Phase 1 of persistent mission
+    -- orchestration). When set, this task belongs to a mission row in
+    -- ``missions`` and its lifecycle is constrained by that mission's
+    -- deterministic waiting_for / next_transition gate. NULL = the task is
+    -- not mission-scoped (legacy / free-standing task, unchanged behaviour).
+    mission_id           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS missions (
+    id                TEXT PRIMARY KEY,
+    title             TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    waiting_for       TEXT NOT NULL,
+    next_transition   TEXT NOT NULL,
+    current_package   TEXT,
+    origin_session    TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2690,6 +2752,43 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # ── Phase 1: persistent missions + mission_id on tasks ─────────────────
+    # Create the missions table if a legacy DB predates it (SCHEMA_SQL only
+    # ran on the original init; this pass upgrades existing boards).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS missions (
+            id                TEXT PRIMARY KEY,
+            title             TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            waiting_for       TEXT NOT NULL,
+            next_transition   TEXT NOT NULL,
+            current_package   TEXT,
+            origin_session    TEXT,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
+        )
+        """
+    )
+    if "mission_id" not in cols:
+        # Mission-scoped task. NULL = not mission-scoped (existing behaviour).
+        _add_column_if_missing(conn, "tasks", "mission_id", "mission_id TEXT")
+
+    # Indexes over additive mission columns must be created after the
+    # columns/table exist (same ordering rule as the additive indexes above:
+    # SCHEMA_SQL's executescript would abort on a missing column for legacy
+    # boards, so they are created here, idempotently).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_mission_id ON tasks(mission_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missions_origin_session "
+        "ON missions(origin_session)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status)"
+    )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3194,6 +3293,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3404,6 +3504,18 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Mission-scoped task validation (Phase 1): if a mission_id is supplied
+    # it MUST reference an existing mission row — fail-closed on a dangling
+    # mission link rather than persisting an orphan task reference.
+    if mission_id is not None:
+        mission_id = str(mission_id).strip() or None
+        if mission_id is not None:
+            mrow = conn.execute(
+                "SELECT id FROM missions WHERE id = ?", (mission_id,)
+            ).fetchone()
+            if mrow is None:
+                raise ValueError(f"mission {mission_id!r} does not exist")
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3508,8 +3620,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, mission_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3647,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        mission_id,
                     ),
                 )
                 for pid in parents:
@@ -3586,6 +3699,186 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     ).fetchall()
     present = {r["id"] for r in rows}
     return [p for p in parents if p not in present]
+
+
+def _new_mission_id() -> str:
+    """Deterministic unique mission id (``m_`` + hex + time)."""
+    return "m_" + uuid.uuid4().hex[:12] + hex(int(time.time() * 1000))[2:8]
+
+
+def create_mission(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    origin_session: Optional[str] = None,
+    initial_status: str = "planned",
+    board: Optional[str] = None,
+) -> str:
+    """Create a persistent mission row in the deterministic lifecycle.
+
+    Phase 1 of persistent mission progression. The mission starts in
+    ``initial_status`` (default ``planned``) with the gate-derived
+    ``waiting_for`` / ``next_transition`` persisted atomically. No
+    auto-orchestration is performed — this only establishes the mission
+    entity so a later phase can drive it deterministically.
+
+    Fail-closed: an unknown ``initial_status`` raises ValueError; the
+    persisted waiting_for/next_transition are always derived from the gate,
+    never caller-supplied.
+    """
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("mission title is required")
+    _mission_gate.phase_for(initial_status)  # raises on unknown status
+    now = int(time.time())
+    mission_id = _new_mission_id()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO missions "
+            "(id, title, status, waiting_for, next_transition, current_package, "
+            " origin_session, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                mission_id,
+                title,
+                initial_status,
+                _mission_gate.expected_waiting_for(initial_status),
+                _mission_gate.expected_next_transition(initial_status),
+                None,  # current_package
+                origin_session,
+                now,
+                now,
+            ),
+        )
+    return mission_id
+
+
+def get_mission(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[Mission]:
+    """Return the mission row, or None if not found."""
+    row = conn.execute(
+        "SELECT id, title, status, waiting_for, next_transition, current_package, "
+        "       origin_session, created_at, updated_at "
+        "FROM missions WHERE id = ?",
+        (mission_id,),
+    ).fetchone()
+    return Mission.from_row(row) if row else None
+
+
+def list_missions(
+    conn: sqlite3.Connection,
+    *,
+    origin_session: Optional[str] = None,
+    status: Optional[str] = None,
+    board: Optional[str] = None,
+) -> list[Mission]:
+    """List missions, optionally filtered by origin_session and/or status.
+
+    ``origin_session`` is the primary recovery key across context compaction
+    and parallel sessions: a resumed agent session can recover every mission
+    it started via its own session id.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if origin_session is not None:
+        clauses.append("origin_session = ?")
+        params.append(origin_session)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT id, title, status, waiting_for, next_transition, current_package, "
+        f"       origin_session, created_at, updated_at "
+        f"FROM missions {where} ORDER BY created_at ASC",
+        params,
+    ).fetchall()
+    return [Mission.from_row(r) for r in rows]
+
+
+def transition_mission(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    transition: str,
+    *,
+    expected_status: Optional[str] = None,
+    board: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Apply a deterministic mission transition (fail-closed, CAS-guarded).
+
+    Validates ``transition`` against the current mission status via the
+    mission transition gate. On success persists the new status AND the
+    gate-derived ``waiting_for`` / ``next_transition`` atomically, and
+    returns ``(True, new_status)``.
+
+    ``expected_status`` is an optimistic concurrency guard for PARALLEL
+    sessions: if the mission is not currently in ``expected_status`` the
+    transition is rejected (``(False, reason)``) instead of racing. This is
+    what makes a recovered session unable to clobber a concurrent one's
+    transition. Pass ``expected_status`` from a freshly-read mission row.
+
+    Fail-closed: unknown transition or a transition not permitted from the
+    current status => ``(False, reason)``; the mission row is unchanged.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM missions WHERE id = ?",
+            (mission_id,),
+        ).fetchone()
+        if row is None:
+            return False, "mission not found"
+        current = row["status"]
+        if expected_status is not None and current != expected_status:
+            return (
+                False,
+                f"mission status changed concurrently: expected {expected_status!r}, "
+                f"actual {current!r}",
+            )
+        try:
+            new_status = _mission_gate.resolve_transition(current, transition)
+        except ValueError as exc:
+            return False, str(exc)
+        cur = conn.execute(
+            "UPDATE missions "
+            "SET status = ?, waiting_for = ?, next_transition = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                new_status,
+                _mission_gate.expected_waiting_for(new_status),
+                _mission_gate.expected_next_transition(new_status),
+                now,
+                mission_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False, "mission update failed (concurrent writer)"
+    return True, new_status
+
+
+def set_mission_current_package(
+    conn: sqlite3.Connection,
+    mission_id: str,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Record which task is the mission's current package.
+
+    Phase 1 scope: this only persists the pointer on the mission row. It
+    does NOT auto-create or auto-advance packages — a later phase drives
+    progression.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE missions SET current_package = ?, updated_at = ? WHERE id = ?",
+            (task_id, int(time.time()), mission_id),
+        )
+        return cur.rowcount == 1
 
 
 def _inherit_notify_subs(
