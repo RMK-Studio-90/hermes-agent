@@ -1,0 +1,7 @@
+name: explicit-skill-loader
+version: "1.0.0"
+description: "Deterministically resolves and loads explicitly requested skills (e.g. 'use skill: plan') before the LLM runs. Bundled backend — auto-loaded, no UI activation required. Never a per-skill special case."
+author: NousResearch
+kind: backend
+hooks:
+  - pre_llm_call
