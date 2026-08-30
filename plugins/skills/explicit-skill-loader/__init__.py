@@ -124,8 +124,19 @@ def resolve_skill_identifier(name: str) -> Tuple[str, str]:
     ``SkillResolutionError`` with a clear message for missing / ambiguous
     references. ``cmd_key`` is ``None`` when resolution succeeded by display
     name only (unreachable here — every key carries its display name).
+
+    Core-command collision: when an installed skill's auto-generated slash
+    command collides with a core Hermes command (e.g. the ``plan`` skill's
+    ``/plan`` collides with the built-in ``/plan``), ``get_skill_commands()``
+    deliberately skips its registration (the skill stays loadable via
+    ``/skill <name>``). A request for such a skill must resolve to the
+    intended SKILL by canonical name/path — NOT fall through to the fuzzy
+    substring candidate set (which could wrongly pick a different skill such
+    as ``weekly-review-planning`` for ``plan``) and NOT hijack the core
+    command. We therefore verify a name that is absent from the command map
+    against the canonical skill registry before attempting fuzzy matching.
     """
-    from agent.skill_commands import get_skill_commands
+    from agent.skill_commands import get_skill_commands, _load_skill_payload
 
     commands = get_skill_commands()  # dict: "/slug" -> {name, description, ...}
     if not commands:
@@ -142,6 +153,16 @@ def resolve_skill_identifier(name: str) -> Tuple[str, str]:
     for key, info in commands.items():
         if _normalize_slug(info.get("name", "")) == request_slug:
             return key, info.get("name") or request_slug
+
+    # 2b. Core-command collision: the requested name is absent from the
+    # command map, but it is a REAL installed skill (loaded by canonical
+    # name/path). That means its auto slash command was skipped because it
+    # collides with a core Hermes command. Resolve it by canonical skill
+    # identity — this is the deterministic intended-skill, and it must NOT
+    # be shadowed by the fuzzy substring fallback below (which could match
+    # an unrelated skill) nor by the colliding core command.
+    if _load_skill_payload(name) is not None:
+        return exact_key, request_slug
 
     # 3. Unambiguous substring/prefix candidate set.
     candidates: List[Tuple[str, str]] = []
@@ -172,6 +193,35 @@ class SkillResolutionError(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 # Load
 # ─────────────────────────────────────────────────────────────────────────────
+def _load_skill_by_name_context(name: str, *, task_id: Optional[str] = None) -> Optional[str]:
+    """Load a skill by canonical name/path and return the activation message.
+
+    Used for core-command collisions where the skill's auto slash command was
+    skipped (so it is absent from ``get_skill_commands()``) but the skill
+    itself remains loadable via ``/skill <name>``. Mirrors the manual/UI path
+    by building the same activation message from ``_load_skill_payload`` +
+    ``_build_skill_message`` — the exact loader the preloaded (``--skills``/
+    ``HERMES_TUI_SKILLS``) path uses for raw identifiers. Returns ``None`` if
+    the skill cannot be loaded by that name.
+    """
+    from agent.skill_commands import _load_skill_payload, _build_skill_message
+
+    loaded = _load_skill_payload(name, task_id=task_id)
+    if not loaded:
+        return None
+    loaded_skill, skill_dir, skill_name = loaded
+    activation_note = (
+        f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]"
+    )
+    return _build_skill_message(
+        loaded_skill,
+        skill_dir,
+        activation_note,
+        session_id=task_id,
+    )
+
+
 def build_explicit_skill_context(
     user_message: Any,
     *,
@@ -184,7 +234,7 @@ def build_explicit_skill_context(
     missing/ambiguous skill it returns a clear BLOCK marker instead of
     ``None`` so the turn fails closed.
     """
-    from agent.skill_commands import build_skill_invocation_message
+    from agent.skill_commands import build_skill_invocation_message, get_skill_commands
 
     name = extract_explicit_skill_request(user_message)
     if name is None:
@@ -200,12 +250,23 @@ def build_explicit_skill_context(
     # loaded payload, activation note, supporting-file list, and config
     # injection are byte-identical to the manual/UI path.
     loaded = build_skill_invocation_message(cmd_key, task_id=task_id)
-    if not loaded:
-        return _block_marker(
-            f"Skill '{display_name}' could not be loaded (load error). "
-            "Fix the skill or use a different one."
-        )
-    return loaded
+    if loaded:
+        return loaded
+
+    # Core-command collision: ``resolve_skill_identifier`` resolved the
+    # requested name to an installed skill, but its auto slash command is
+    # absent from the command map (skipped because it collides with a core
+    # Hermes command). ``build_skill_invocation_message`` therefore returns
+    # None. Load by canonical skill name/path instead — this is the intended
+    # skill (never the core command), deterministically.
+    if cmd_key not in get_skill_commands():
+        by_name = _load_skill_by_name_context(display_name or name, task_id=task_id)
+        if by_name:
+            return by_name
+    return _block_marker(
+        f"Skill '{display_name}' could not be loaded (load error). "
+        "Fix the skill or use a different one."
+    )
 
 
 def _block_marker(reason: str) -> str:
