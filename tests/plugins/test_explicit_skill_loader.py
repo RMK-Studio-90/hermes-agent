@@ -145,9 +145,33 @@ def test_stopword_guard_keeps_valid_plan_skill(message, expected):
 # Resolution against REAL skills (production home restored)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_resolve_plan_real(real_home):
+    """'plan' now collides with the built-in core /plan command, so its auto
+    slash command is skipped from the command map. The loader must still
+    resolve the intended 'plan' SKILL by canonical identity — NOT fall
+    through to a fuzzy match on an unrelated skill (e.g. weekly-review-
+    planning) and NOT hijack the core /plan command."""
     key, display = resolve_skill_identifier("plan")
-    assert key == "/plan"
+    # The requested skill name is the canonical identity; it must resolve to
+    # the plan skill, not to some substring lookalike.
     assert display == "plan"
+    # The returned key is the canonical slug for the requested skill. Because
+    # /plan collides with the core command it is absent from the command map,
+    # which the loader interprets as "load by canonical name" (not an error).
+    from agent.skill_commands import get_skill_commands
+    assert key == "/plan"
+    assert key not in get_skill_commands()  # skipped due to core collision
+    # And critically: it must NOT resolve to the weekly-review-planning skill.
+    assert display != "weekly-review-planning"
+
+
+def test_resolve_plan_loads_canonical_skill_not_core(real_home):
+    """Loading 'plan' via the explicit loader must produce the plan SKILL's
+    activation content (canonical identity), never the core /plan command."""
+    from agent.skill_commands import _load_skill_payload
+    # The canonical name path resolves to the plan skill itself.
+    loaded = _load_skill_payload("plan")
+    assert loaded is not None
+    assert loaded[2] == "plan"
 
 
 def test_resolve_obsidian_real(real_home):
@@ -191,6 +215,18 @@ def test_build_context_plan_real(real_home):
     assert ctx is not None
     assert "plan" in ctx
     assert "[IMPORTANT: The user has invoked" in ctx
+
+
+def test_build_context_plan_collision_loads_skill_not_core_or_lookalike(real_home):
+    """Regression for the core /plan collision: an explicit 'plan' request must
+    load the plan SKILL by canonical identity, never the core /plan command and
+    never a fuzzy substring lookalike (weekly-review-planning)."""
+    ctx = build_explicit_skill_context("use skill: plan")
+    assert ctx is not None
+    assert "plan" in ctx
+    # The loaded skill's activation names the plan skill, not a lookalike.
+    assert "plan" in ctx.lower()
+    assert "weekly-review-planning" not in ctx.lower()
 
 
 def test_build_context_obsidian_real(real_home):
