@@ -111,6 +111,37 @@ def test_no_false_positive(message):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stopword / false-positive guard regression (W1 hardening)
+# ─────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Natural-language "skill" mentions must NOT extract a stopword
+        # (preposition/article) as the skill name — previously these fell
+        # through to a spurious fail-closed BLOCK.
+        "use the skill of active listening",
+        "use the skill for planning",
+        "I would like to use the skill of active listening",
+        "use the skill with care",
+    ],
+)
+def test_natural_language_skill_phrase_no_false_positive(message):
+    assert extract_explicit_skill_request(message) is None
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        # The stopword guard must not break valid self-contained forms.
+        ("use the plan skill", "plan"),
+        ("Please use the plan skill now", "plan"),
+    ],
+)
+def test_stopword_guard_keeps_valid_plan_skill(message, expected):
+    assert extract_explicit_skill_request(message) == expected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Resolution against REAL skills (production home restored)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_resolve_plan_real(real_home):

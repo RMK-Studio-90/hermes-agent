@@ -64,6 +64,20 @@ _SKILL_REQUEST_RE = re.compile(
 # Strip trailing punctuation / filler that is not part of a skill name.
 _TRAILING_RE = re.compile(r"[.,;:!?)\]]+$")
 
+# English + German function words that never name a skill. Guards against a
+# natural-language preposition/article after "skill" being captured as the
+# skill name (e.g. "use the skill of active listening" -> "of"). Compared
+# case-insensitively; real skill names are never these function words.
+_STOPWORDS = frozenset({
+    # English
+    "a", "an", "and", "about", "as", "at", "by", "for", "from", "in",
+    "into", "of", "on", "the", "to", "with", "within", "without",
+    # German
+    "an", "auf", "bei", "das", "den", "der", "des", "die", "ein", "eine",
+    "einem", "einen", "einer", "fuer", "für", "mit", "nach", "ueber",
+    "über", "um", "und", "unter", "von", "zu",
+})
+
 
 def extract_explicit_skill_request(user_message: Any) -> Optional[str]:
     """Return the requested skill name if the message explicitly requests one.
@@ -87,7 +101,9 @@ def extract_explicit_skill_request(user_message: Any) -> Optional[str]:
     if not name:
         return None
     name = _TRAILING_RE.sub("", name).strip()
-    return name or None
+    if not name or name.lower() in _STOPWORDS:
+        return None
+    return name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
