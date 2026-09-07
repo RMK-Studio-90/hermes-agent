@@ -256,12 +256,12 @@ def begin_iteration(
 
     # Aggregate input budget for detached auxiliary forks bounds the whole review, not
     # each request; checked between iterations so the crossing request's writes landed.
-    if _review_input_budget_exhausted(agent):
+    if _review_input_budget_exhausted(agent, messages):
         _turn_exit_reason = "review_input_budget_exhausted"
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⏹️  Review input budget exhausted "
-                f"({int(agent.session_input_tokens):,} tokens) — stopping "
+                f"\n⏹️  Review input budget reached "
+                f"({int(agent.session_input_tokens):,} billed tokens) — stopping "
                 f"the review tool loop before the next provider call."
             )
         return _verdict("break")

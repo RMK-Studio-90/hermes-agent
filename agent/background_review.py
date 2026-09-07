@@ -1033,9 +1033,16 @@ def build_cache_parity_fork(
         review_agent._cached_system_prompt = agent._cached_system_prompt
         review_agent.session_start = agent.session_start
     _detach_fork_compression(review_agent)
-    # Compaction bounds a single request; this bounds the WHOLE review (checked in
-    # conversation_loop via _review_input_budget_exhausted).
+    # Compaction bounds a single request; these bound the WHOLE review (checked in
+    # conversation_loop via _review_input_budget_exhausted). The caller may override
+    # _review_input_token_budget (e.g. /refine's looser cap) after this returns.
     review_agent._review_input_token_budget = _review_input_token_budget(task_cfg)
+    _cfg = _background_review_task_config(task_cfg)
+    try:
+        review_agent._review_max_context_tokens = max(0, int(_cfg.get("max_context_tokens", 0)))
+    except (TypeError, ValueError):
+        review_agent._review_max_context_tokens = 0
+    review_agent._review_predictive_budget = is_truthy_value(_cfg.get("predictive_budget"), default=True)
     return review_agent, _rt, _routed
 
 
