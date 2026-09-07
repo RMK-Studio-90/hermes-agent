@@ -540,14 +540,26 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]])
 
 
 def _tick_memory_nudge(agent: Any) -> bool:
-    """Advance the turn-based memory nudge counter; ``True`` when the review should fire."""
-    if (agent._memory_nudge_interval > 0
+    """Advance the turn-based memory nudge counter; ``True`` when the review should fire.
+
+    Due at the base interval, then held back by the per-session background-review backoff
+    multiplier (raised after consecutive unproductive reviews; reset by a write or /refine).
+    The counter is NOT reset while the multiplier is deferring, so it keeps accruing toward
+    ``interval * multiplier``.
+    """
+    if not (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
-        agent._turns_since_memory += 1
-        if agent._turns_since_memory >= agent._memory_nudge_interval:
-            agent._turns_since_memory = 0
-            return True
+        return False
+    agent._turns_since_memory += 1
+    if agent._turns_since_memory < agent._memory_nudge_interval:
+        return False
+    from agent.background_review import review_backoff_multiplier
+    mult = review_backoff_multiplier(agent)
+    agent._bg_review_backoff_multiplier = mult
+    if agent._turns_since_memory >= agent._memory_nudge_interval * mult:
+        agent._turns_since_memory = 0
+        return True
     return False
 
 

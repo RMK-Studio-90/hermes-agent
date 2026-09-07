@@ -32,6 +32,41 @@ _SESSION_TOKEN_KEYS = (
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
 
 
+def evaluate_skill_review_trigger(agent: Any) -> bool:
+    """Decide whether an automatic skill review should spawn after this turn.
+
+    1. Base cadence: ``_iters_since_skill >= _skill_nudge_interval`` (accrues across turns,
+       resets on a ``skill_manage`` call or a fired review) and the tool is available.
+    2. Per-session backoff: after consecutive unproductive reviews the effective interval
+       is multiplied (``review_backoff_multiplier``); a write or ``/refine`` resets it.
+    3. New-user-signal floor: at least ``_min_user_turns_between_skill_reviews`` new user
+       turns since the last skill review — so a long tool loop with no new user message
+       cannot keep firing reviews. ``0`` disables the floor (legacy behavior).
+
+    Side effects on a fire: resets ``_iters_since_skill`` and stamps
+    ``_user_turn_at_last_skill_review``. Always stamps ``_bg_review_backoff_multiplier``
+    when the base cadence is due (telemetry reads it). Shared by the chat-completions
+    finalizer and the codex runtime so the gate cannot diverge.
+    """
+    if not (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and getattr(agent, "_iters_since_skill", 0) >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", ())
+    ):
+        return False
+    from agent.background_review import review_backoff_multiplier
+
+    mult = review_backoff_multiplier(agent)
+    agent._bg_review_backoff_multiplier = mult
+    min_user_turns = getattr(agent, "_min_user_turns_between_skill_reviews", 1)
+    user_turns_since = getattr(agent, "_user_turn_count", 0) - getattr(agent, "_user_turn_at_last_skill_review", 0)
+    if agent._iters_since_skill >= agent._skill_nudge_interval * mult and user_turns_since >= min_user_turns:
+        agent._iters_since_skill = 0
+        agent._user_turn_at_last_skill_review = getattr(agent, "_user_turn_count", 0)
+        return True
+    return False
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -584,14 +619,9 @@ def finalize_turn(
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    )
-    if _should_review_skills:
-        agent._iters_since_skill = 0
+    # Skill review gate (shared with the codex runtime): base tool-iteration cadence, then the
+    # per-session backoff multiplier and the "new user turn since last skill review" floor.
+    _should_review_skills = evaluate_skill_review_trigger(agent)
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(

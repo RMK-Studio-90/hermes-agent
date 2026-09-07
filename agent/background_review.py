@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -749,6 +750,82 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+# STEP 3 — per-session consecutive-unproductive backoff -----------------------
+# After a session's reviews keep returning nothing, multiply that session's nudge
+# interval so a stable session is not reviewed on every cadence tick. A productive
+# write (or an explicit /refine) resets the streak. Never disables review — the
+# multiplier is capped and /refine always bypasses it.
+_BACKOFF_META_PREFIX = "bg_review_backoff:"
+_PRODUCTIVE_OUTCOMES = frozenset({"memory_written", "skill_written", "memory_and_skill"})
+_UNPRODUCTIVE_OUTCOMES = frozenset({"no_change", "budget_exhausted", "iteration_limit"})
+
+
+def _backoff_cfg(task_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = _background_review_task_config(task_cfg).get("backoff")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _backoff_streak(agent: Any) -> int:
+    """Consecutive-unproductive count for this agent's session (0 when unknown)."""
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if db is None or not sid or not hasattr(db, "get_meta"):
+        return 0
+    try:
+        raw = db.get_meta(_BACKOFF_META_PREFIX + str(sid))
+        return max(0, int(json.loads(raw).get("consecutive_none", 0))) if raw else 0
+    except Exception:
+        return 0
+
+
+def review_backoff_multiplier(agent: Any, task_cfg: Optional[Dict[str, Any]] = None) -> int:
+    """Nudge-interval multiplier for this session. 1 unless backoff is enabled AND the
+    session has >=2 consecutive unproductive reviews. base**(streak-1), capped."""
+    cfg = _backoff_cfg(task_cfg)
+    if not is_truthy_value(cfg.get("enabled"), default=True):
+        return 1
+    streak = _backoff_streak(agent)
+    if streak <= 1:
+        return 1
+    try:
+        base = max(1, int(cfg.get("base_multiplier", 2)))
+        cap = max(1, int(cfg.get("max_multiplier", 8)))
+    except (TypeError, ValueError):
+        base, cap = 2, 8
+    return min(base ** (streak - 1), cap)
+
+
+def _set_backoff_streak(agent: Any, value: int) -> None:
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if db is None or not sid or not hasattr(db, "set_meta"):
+        return
+    try:
+        db.set_meta(
+            _BACKOFF_META_PREFIX + str(sid),
+            json.dumps({"consecutive_none": max(0, int(value)), "updated_at": time.time()}),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("background review backoff write failed (non-fatal): %s", e)
+
+
+def _update_backoff_after_review(agent: Any, outcome: str, task_cfg: Optional[Dict[str, Any]]) -> None:
+    """Advance/reset the session's unproductive streak from one review's outcome."""
+    if not is_truthy_value(_backoff_cfg(task_cfg).get("enabled"), default=True):
+        return
+    if outcome in _PRODUCTIVE_OUTCOMES:
+        _set_backoff_streak(agent, 0)
+    elif outcome in _UNPRODUCTIVE_OUTCOMES:
+        _set_backoff_streak(agent, _backoff_streak(agent) + 1)
+    # error / cancelled: leave the streak unchanged.
+
+
+def reset_review_backoff(agent: Any) -> None:
+    """Clear the session's unproductive streak (explicit /refine or /goal)."""
+    if _backoff_streak(agent):
+        _set_backoff_streak(agent, 0)
+
+
 # STEP 2 telemetry -----------------------------------------------------------
 _RESULT_TO_OUTCOME = {
     "none": "no_change", "skill": "skill_written", "memory": "memory_written",
@@ -775,24 +852,24 @@ def _write_review_telemetry(
     parent_agent: Any, st: "_ReviewForkState", *, result: str, trigger: Optional[str],
     task_cfg: Optional[Dict[str, Any]], duration_ms: int, max_iters: int,
     outcome_override: Optional[str] = None, error_code: Optional[str] = None,
-) -> None:
-    """Write one background_review_event row against the PARENT session's DB. Best-effort:
-    counters + enums only, never conversation content; never raises into the review thread."""
+) -> str:
+    """Write one background_review_event row against the PARENT session's DB and return the
+    classified ``outcome`` (needed for the backoff update even when telemetry is off).
+    Best-effort: counters + enums only, never conversation content; never raises."""
+    u = st.review_usage or {}
+    api_calls = int(u.get("api_calls") or 0)
+    if outcome_override:
+        outcome, reason_code = outcome_override, None
+    else:
+        outcome, reason_code = _review_outcome(st.exit_reason, result, api_calls, max_iters)
     try:
-        from utils import is_truthy_value
         cfg = _background_review_task_config(task_cfg)
         if not is_truthy_value(cfg.get("telemetry"), default=True):
-            return
+            return outcome
         db = getattr(parent_agent, "_session_db", None)
         rec = getattr(db, "record_background_review_event", None)
         if db is None or not callable(rec):
-            return
-        u = st.review_usage or {}
-        api_calls = int(u.get("api_calls") or 0)
-        if outcome_override:
-            outcome, reason_code = outcome_override, None
-        else:
-            outcome, reason_code = _review_outcome(st.exit_reason, result, api_calls, max_iters)
+            return outcome
         try:
             from hermes_cli.profiles import get_active_profile_name
             profile = get_active_profile_name()
@@ -823,6 +900,7 @@ def _write_review_telemetry(
         )
     except Exception as e:  # noqa: BLE001 — telemetry must never break a review
         logger.debug("background review telemetry write failed (non-fatal): %s", e)
+    return outcome
 
 
 # OpenRouter provider-routing pins: prompt caches live per UPSTREAM provider, so a fork without
@@ -1226,10 +1304,11 @@ def _run_review_in_thread(
             actions = []
         _result = _classify_review_result(actions)
         _log_review_completion(st.review_usage, _result)
-        _write_review_telemetry(
+        _outcome = _write_review_telemetry(
             agent, st, result=_result, trigger=trigger, task_cfg=task_cfg,
             duration_ms=int((time.monotonic() - _t0) * 1000), max_iters=_max_iters,
         )
+        _update_backoff_after_review(agent, _outcome, task_cfg)
         if actions:
             _publish_review_summary(agent, actions)
     except Exception as e:
@@ -1284,6 +1363,10 @@ def spawn_background_review_thread(
     prompt = getattr(agent, name, globals()[name])
     _is_refine = explicit or bool((focus or "").strip())
     trigger = "refine" if _is_refine else _TRIGGER_BY_SCOPE[(review_memory, review_skills)]
+    if _is_refine:
+        # An explicit ask clears the session's unproductive-review streak.
+        with suppress(Exception):
+            reset_review_backoff(agent)
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "
