@@ -877,11 +877,27 @@ prompt_caching:
 #
 #   # Post-turn memory/skill self-improvement review fork. Runs after a turn
 #   # when the nudge intervals fire; writes skills/memories in a daemon thread.
-#   # Usage is recorded under session_model_usage task='background_review'.
+#   # Usage is recorded under session_model_usage task='background_review';
+#   # per-fork outcome/cost is recorded in the background_review_event table.
 #   background_review:
-#     enabled: true            # false = skip automatic forks (/refine still works)
-#     provider: "auto"         # or pin a cheaper model (see memory.md)
+#     enabled: true                 # false = skip automatic forks (/refine still works)
+#     provider: "auto"              # or pin a cheaper model (see memory.md)
 #     model: ""
+#     max_input_tokens: 200000      # cap on BILLED (non-cached) input over the review loop;
+#                                   # loop stops BEFORE crossing it. <= 0 = unlimited
+#     max_context_tokens: 0         # optional extra cap on billed_input + cache_read. 0 = off
+#     max_iterations: 6             # hard cap on the fork's tool-loop iterations (auto reviews)
+#     refine_max_input_tokens: 600000   # looser caps for explicit /refine
+#     refine_max_iterations: 16
+#     min_user_turns_between_skill_reviews: 1  # skip skill review until this many new USER turns
+#                                   # since the last one (stops long tool loops from firing reviews).
+#                                   # 0 = legacy
+#     predictive_budget: true       # false = legacy post-hoc budget check (can overshoot one request)
+#     telemetry: true               # false = skip the background_review_event table write
+#     backoff:                      # after consecutive unproductive reviews for a session, multiply
+#       enabled: true               # that session's nudge interval. A write or /refine resets it.
+#       base_multiplier: 2
+#       max_multiplier: 8
 
 # =============================================================================
 # Persistent Memory

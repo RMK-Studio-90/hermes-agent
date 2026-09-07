@@ -366,13 +366,18 @@ _DO_NOT_CAPTURE_BLOCK = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
-    "at least one skill update, even if small. A pass that does nothing is a missed learning "
-    "opportunity, not a neutral outcome.\n\n"
+    "Review the conversation above and update the skill library ONLY if it is warranted. Most "
+    "sessions require no durable change. Change a skill only when the conversation contains clear, "
+    "REUSABLE evidence — repeated behaviour, an explicit correction, or a non-trivial technique — "
+    "that will improve a FUTURE session's first attempt at this class of task. Do not manufacture "
+    "an update to avoid an empty result: an unjustified skill edit is worse than none, because a "
+    "future session will trust and repeat it. If the evidence is weak, transient, session-specific, "
+    "one-off, redundant, or already covered by an existing skill, reply 'Nothing to save.' and "
+    "stop.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
-    "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
-    "WHETHER you update.\n\n" + _LESSON_LAYER_BLOCK +
+    "not an umbrella hoarding a references/ file per session. This shapes HOW you update when an "
+    "update is warranted.\n\n" + _LESSON_LAYER_BLOCK +
     "Signals to look for (any one of these warrants action):\n"
     "  • User corrected your style, tone, format, legibility, or verbosity. Frustration signals "
     "like 'stop doing X', 'this is too verbose', 'don't format like this', 'why are you "
@@ -446,9 +451,9 @@ _SKILL_REVIEW_PROMPT = (
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
-    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
-    "stop. Otherwise, act."
+    "'Nothing to save.' is the correct, common outcome. Act only when a signal above actually "
+    "fired and the evidence is reusable; if the session ran smoothly with no correction and no new "
+    "reusable technique, say 'Nothing to save.' and stop."
 )
 
 _COMBINED_REVIEW_PROMPT = (
@@ -456,9 +461,11 @@ _COMBINED_REVIEW_PROMPT = (
     "**Memory**: who the user is. Did the user reveal persona, desires, preferences, personal "
     "details, or expectations about how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
-    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "**Skills**: how to do this class of task. Change a skill ONLY when the conversation holds "
+    "clear, REUSABLE evidence — repeated behaviour, an explicit correction, or a non-trivial "
+    "technique — that will improve a future session's first attempt. Most sessions need no skill "
+    "change; an unjustified edit is worse than none. Do not edit a skill just to avoid an empty "
+    "result.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
@@ -512,8 +519,8 @@ _COMBINED_REVIEW_PROMPT = (
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
-    "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
-    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
+    "Act on whichever of the two dimensions has real, reusable signal. If nothing stands out on "
+    "either — the common case — say 'Nothing to save.' and stop."
 )
 
 

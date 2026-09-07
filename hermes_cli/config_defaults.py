@@ -735,10 +735,34 @@ DEFAULT_CONFIG = {
         "monitor": _aux(60),   # important-mail 0-10 scorer; high-volume, small model fine
         # Post-turn self-improvement fork (save memory / patch skill). "auto" = main model replaying
         # the full conversation (warm cache); other models replay a compact digest (~3-5x cheaper).
-        # enabled=false skips auto spawns (/refine still works). max_input_tokens caps the SUM of
-        # replayed input tokens over the review loop (iterations capped at 16); the loop stops
-        # before crossing it. <= 0 = unlimited.
-        "background_review": {"enabled": True, **_aux(120), "max_input_tokens": 600000},
+        # enabled=false skips auto spawns (/refine still works).
+        #   max_input_tokens      caps the SUM of BILLED (non-cached) input over the review loop;
+        #                         the loop stops BEFORE crossing it (predictive preflight). <= 0 = unlimited.
+        #   max_context_tokens    optional extra cap on billed_input + cache_read (assembled-context
+        #                         pressure). 0 = disabled.
+        #   max_iterations        hard cap on the fork's tool-loop iterations (auto reviews).
+        #   refine_max_input_tokens / refine_max_iterations  the (looser) caps for explicit /refine.
+        #   min_user_turns_between_skill_reviews  skip the skill review unless this many new USER
+        #                         turns have happened since the last one (stops long tool loops from
+        #                         driving review pressure with no new user signal). 0 = legacy.
+        #   backoff               after consecutive unproductive reviews for a session, multiply that
+        #                         session's nudge interval (x2 after 2, x4 after 3, ... capped).
+        #                         enabled=false disables. A productive write or /refine resets it.
+        #   predictive_budget     false = legacy post-hoc budget check (may overshoot by one request).
+        #   telemetry             false = skip the background_review_event table write.
+        "background_review": {
+            "enabled": True,
+            **_aux(120),
+            "max_input_tokens": 200000,
+            "max_context_tokens": 0,
+            "max_iterations": 6,
+            "refine_max_input_tokens": 600000,
+            "refine_max_iterations": 16,
+            "min_user_turns_between_skill_reviews": 1,
+            "predictive_budget": True,
+            "telemetry": True,
+            "backoff": {"enabled": True, "base_multiplier": 2, "max_multiplier": 8},
+        },
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
@@ -1305,6 +1329,11 @@ DEFAULT_CONFIG = {
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Cumulative tool-loop iterations between automatic skill-review forks (0 = disable auto skill
+        # review; /refine still works). Also gated by
+        # auxiliary.background_review.min_user_turns_between_skill_reviews so a long tool loop with no
+        # new user message cannot keep firing reviews.
+        "creation_nudge_interval": 10,
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.
