@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -153,6 +154,9 @@ _REVIEW_MAX_ITERATIONS = 16
 # request, but nothing else caps the SUM across the tool loop. 2x the historical 300k foreground
 # trigger. Override via ``auxiliary.background_review.max_input_tokens``; <= 0 disables.
 _REVIEW_MAX_INPUT_TOKENS_DEFAULT = 600_000
+
+# Sentinel: "caller did not pass an override" (distinct from an explicit None = unlimited budget).
+_UNSET: Any = object()
 
 
 def _task_block(cfg: Any) -> Dict[str, Any]:
@@ -745,6 +749,82 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+# STEP 2 telemetry -----------------------------------------------------------
+_RESULT_TO_OUTCOME = {
+    "none": "no_change", "skill": "skill_written", "memory": "memory_written",
+    "skill+memory": "memory_and_skill", "memory+skill": "memory_and_skill",
+}
+
+
+def _review_outcome(
+    exit_reason: Optional[str], result: str, api_calls: int, max_iters: int,
+) -> Tuple[str, Optional[str]]:
+    """(outcome, reason_code) for one completed review fork. Control-flow first
+    (budget / iteration / cancel), then the write classification."""
+    er = str(exit_reason or "")
+    if er == "review_input_budget_exhausted":
+        return "budget_exhausted", "post_hoc"
+    if er.startswith(("interrupted_by_user", "interrupted_during_api_call")):
+        return "cancelled", er
+    if er.startswith("max_iterations_reached") or (max_iters and api_calls >= max_iters):
+        return "iteration_limit", er or None
+    return _RESULT_TO_OUTCOME.get(result, "no_change"), None
+
+
+def _write_review_telemetry(
+    parent_agent: Any, st: "_ReviewForkState", *, result: str, trigger: Optional[str],
+    task_cfg: Optional[Dict[str, Any]], duration_ms: int, max_iters: int,
+    outcome_override: Optional[str] = None, error_code: Optional[str] = None,
+) -> None:
+    """Write one background_review_event row against the PARENT session's DB. Best-effort:
+    counters + enums only, never conversation content; never raises into the review thread."""
+    try:
+        from utils import is_truthy_value
+        cfg = _background_review_task_config(task_cfg)
+        if not is_truthy_value(cfg.get("telemetry"), default=True):
+            return
+        db = getattr(parent_agent, "_session_db", None)
+        rec = getattr(db, "record_background_review_event", None)
+        if db is None or not callable(rec):
+            return
+        u = st.review_usage or {}
+        api_calls = int(u.get("api_calls") or 0)
+        if outcome_override:
+            outcome, reason_code = outcome_override, None
+        else:
+            outcome, reason_code = _review_outcome(st.exit_reason, result, api_calls, max_iters)
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except Exception:
+            profile = None
+        import uuid as _uuid
+        rec(
+            event_id=str(_uuid.uuid4()),
+            session_id=getattr(parent_agent, "session_id", None),
+            profile=profile,
+            source=getattr(parent_agent, "platform", None),
+            trigger=trigger,
+            outcome=outcome,
+            provider=u.get("provider"),
+            model=u.get("model"),
+            routed=1 if st.routed else 0,
+            context_strategy="digest" if st.routed else "full",
+            provider_calls=api_calls,
+            input_tokens=int(u.get("input_tokens") or 0),
+            output_tokens=int(u.get("output_tokens") or 0),
+            cache_read_tokens=int(u.get("cache_read_tokens") or 0),
+            duration_ms=int(duration_ms or 0),
+            wrote_memory=1 if outcome in ("memory_written", "memory_and_skill") else 0,
+            wrote_skill=1 if outcome in ("skill_written", "memory_and_skill") else 0,
+            reason_code=reason_code,
+            error_code=error_code,
+            backoff_multiplier=int(getattr(parent_agent, "_bg_review_backoff_multiplier", 1) or 1),
+        )
+    except Exception as e:  # noqa: BLE001 — telemetry must never break a review
+        logger.debug("background review telemetry write failed (non-fatal): %s", e)
+
+
 # OpenRouter provider-routing pins: prompt caches live per UPSTREAM provider, so a fork without
 # the parent's pins can land on a different upstream and miss the warm cache even with
 # byte-identical prompt/tools bytes.
@@ -968,6 +1048,8 @@ class _ReviewForkState:
     review_agent: Any = None
     review_messages: List[Dict] = field(default_factory=list)
     review_usage: Dict[str, Any] = field(default_factory=dict)
+    routed: bool = False
+    exit_reason: Optional[str] = None
 
 
 def _release_fork_clients(review_agent: Any) -> None:
@@ -980,11 +1062,21 @@ def _release_fork_clients(review_agent: Any) -> None:
 def _run_review_fork(
     agent: Any, messages_snapshot: List[Dict], prompt: str, task_cfg: Optional[Dict[str, Any]],
     review_run: Optional[_BackgroundReviewRun], st: _ReviewForkState,
+    *, max_iterations: Optional[int] = None, input_token_budget: Optional[int] = _UNSET,
 ) -> None:
     """Fork phase (inside thread-scoped silence): build the fork, run the prompt under the tool
     whitelist, snapshot its messages/usage, release its clients. Partial progress lands on ``st``
-    so the caller's error path still sees usage and the fork to clean up."""
-    st.review_agent, _rt, _routed = build_cache_parity_fork(agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
+    so the caller's error path still sees usage and the fork to clean up.
+
+    ``max_iterations`` / ``input_token_budget`` override the auto-review caps (used by /refine,
+    which passes the looser ``refine_*`` values); when unset the fork's own resolution applies."""
+    st.review_agent, _rt, _routed = build_cache_parity_fork(
+        agent, task_cfg,
+        max_iterations=_REVIEW_MAX_ITERATIONS if max_iterations is None else int(max_iterations),
+    )
+    st.routed = bool(_routed)
+    if input_token_budget is not _UNSET:
+        st.review_agent._review_input_token_budget = input_token_budget
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
     review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg)
@@ -1007,7 +1099,7 @@ def _run_review_fork(
     try:
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
-            st.review_agent.run_conversation(
+            _result = st.review_agent.run_conversation(
                 user_message=(
                     prompt + "\n\nYou can only call memory and skill "
                     "management tools. Other tools will be denied "
@@ -1015,6 +1107,8 @@ def _run_review_fork(
                 ),
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
+            if isinstance(_result, dict):
+                st.exit_reason = _result.get("turn_exit_reason")
     finally:
         clear_thread_tool_whitelist()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters
@@ -1040,9 +1134,32 @@ def _publish_review_summary(agent: Any, actions: List[str]) -> None:
             agent.background_review_callback(f"💾 Self-improvement review: {summary}")
 
 
+def _resolve_review_caps(task_cfg: Optional[Dict[str, Any]], explicit: bool) -> Tuple[int, Optional[int]]:
+    """(max_iterations, input_token_budget) for this fork. ``explicit`` (/refine) gets the
+    looser ``refine_*`` caps; automatic reviews get the tighter defaults. A non-positive
+    input budget means unlimited (None)."""
+    cfg = _background_review_task_config(task_cfg)
+    if explicit:
+        it = cfg.get("refine_max_iterations", _REVIEW_MAX_ITERATIONS)
+        ib = cfg.get("refine_max_input_tokens", _REVIEW_MAX_INPUT_TOKENS_DEFAULT)
+    else:
+        it = cfg.get("max_iterations", 6)
+        ib = cfg.get("max_input_tokens", _REVIEW_MAX_INPUT_TOKENS_DEFAULT)
+    try:
+        it = max(1, int(it))
+    except (TypeError, ValueError):
+        it = _REVIEW_MAX_ITERATIONS if explicit else 6
+    try:
+        ib = int(ib)
+    except (TypeError, ValueError):
+        ib = _REVIEW_MAX_INPUT_TOKENS_DEFAULT
+    return it, (ib if ib > 0 else None)
+
+
 def _run_review_in_thread(
     agent: Any, messages_snapshot: List[Dict], prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
+    *, trigger: Optional[str] = None, explicit: bool = False,
 ) -> None:
     """Daemon-thread worker: build the fork, run the prompt, surface the action summary via
     ``agent._safe_print`` / ``background_review_callback``. ``review_run`` (from
@@ -1051,6 +1168,8 @@ def _run_review_in_thread(
 
     See #84423.
     """
+    _max_iters, _input_budget = _resolve_review_caps(task_cfg, explicit)
+    _t0 = time.monotonic()
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
         return
@@ -1077,7 +1196,10 @@ def _run_review_in_thread(
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
         with thread_scoped_silence():
-            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st)
+            _run_review_fork(
+                agent, messages_snapshot, prompt, task_cfg, review_run, st,
+                max_iterations=_max_iters, input_token_budget=_input_budget,
+            )
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:
@@ -1102,13 +1224,23 @@ def _run_review_in_thread(
                 e,
             )
             actions = []
-        _log_review_completion(st.review_usage, _classify_review_result(actions))
+        _result = _classify_review_result(actions)
+        _log_review_completion(st.review_usage, _result)
+        _write_review_telemetry(
+            agent, st, result=_result, trigger=trigger, task_cfg=task_cfg,
+            duration_ms=int((time.monotonic() - _t0) * 1000), max_iters=_max_iters,
+        )
         if actions:
             _publish_review_summary(agent, actions)
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         if st.review_usage:
             _log_review_completion(st.review_usage, "error")
+        _write_review_telemetry(
+            agent, st, result="none", trigger=trigger, task_cfg=task_cfg,
+            duration_ms=int((time.monotonic() - _t0) * 1000), max_iters=_max_iters,
+            outcome_override="error", error_code=type(e).__name__,
+        )
         agent._emit_auxiliary_failure("background review", e)
     finally:
         # Safety net for the exception path (setup failures before the request-phase finally).
@@ -1128,22 +1260,30 @@ _PROMPT_NAME_BY_SCOPE = {
     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
     (False, True): "_SKILL_REVIEW_PROMPT", (False, False): "_SKILL_REVIEW_PROMPT",
 }
+_TRIGGER_BY_SCOPE = {
+    (True, True): "combined", (True, False): "memory_nudge",
+    (False, True): "skill_nudge", (False, False): "skill_nudge",
+}
 
 
 def spawn_background_review_thread(
     agent: Any, messages_snapshot: List[Dict], review_memory: bool = False,
     review_skills: bool = False, focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
+    explicit: bool = False,
 ):
     """Return ``(target, prompt)``; the caller builds the ``threading.Thread`` so test patches of
     ``run_agent.threading.Thread`` keep working. ``focus`` (``/refine [instructions]``) is appended
-    to the chosen prompt; automatic reviews pass ``None``. ``task_cfg`` is the pre-loaded
-    ``auxiliary.background_review`` block; when omitted it is read once here."""
+    to the chosen prompt; automatic reviews pass ``None``. ``explicit`` marks the /refine or /goal
+    path, which uses the looser ``refine_*`` caps and a ``refine`` telemetry trigger. ``task_cfg``
+    is the pre-loaded ``auxiliary.background_review`` block; when omitted it is read once here."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
+    _is_refine = explicit or bool((focus or "").strip())
+    trigger = "refine" if _is_refine else _TRIGGER_BY_SCOPE[(review_memory, review_skills)]
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "
@@ -1151,7 +1291,10 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
-        _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
+            trigger=trigger, explicit=_is_refine,
+        )
 
     return _target, prompt
 

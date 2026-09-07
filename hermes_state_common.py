@@ -487,6 +487,35 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+-- One row per completed background memory/skill review fork (agent/background_review.py).
+-- Counters + enums only; NO conversation text, tool payloads, or memory/skill bodies.
+-- The fork runs detached (_session_db=None); this row is written against the PARENT session's
+-- DB at fork completion. Coarser than logs (which stay), finer than session_model_usage
+-- (which has no outcome). Never garbage-collected with the session — soft session_id link.
+CREATE TABLE IF NOT EXISTS background_review_event (
+    event_id           TEXT PRIMARY KEY,
+    ts                 REAL NOT NULL,
+    session_id         TEXT,
+    profile            TEXT,
+    source             TEXT,
+    trigger            TEXT,
+    outcome            TEXT NOT NULL,
+    provider           TEXT,
+    model              TEXT,
+    routed             INTEGER NOT NULL DEFAULT 0,
+    context_strategy   TEXT,
+    provider_calls     INTEGER NOT NULL DEFAULT 0,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    duration_ms        INTEGER NOT NULL DEFAULT 0,
+    wrote_memory       INTEGER NOT NULL DEFAULT 0,
+    wrote_skill        INTEGER NOT NULL DEFAULT 0,
+    reason_code        TEXT,
+    error_code         TEXT,
+    backoff_multiplier INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -507,6 +536,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_bre_session ON background_review_event(session_id);
+CREATE INDEX IF NOT EXISTS idx_bre_ts ON background_review_event(ts);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
