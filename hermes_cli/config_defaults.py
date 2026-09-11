@@ -19,6 +19,12 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
+    # HGES is explicitly invoked with `hermes graph run`; ordinary chat is unchanged.
+    "graph": {
+        "node_tokens": 24000, "output_tokens": 4000, "node_timeout": 120,
+        "budget": {"max_nodes": 30, "max_tokens": 400000, "max_model_calls": 24,
+                   "max_runtime_seconds": 900, "max_repair_cycles": 2},
+    },
     "model": "",
     "providers": {},
     "fallback_providers": [],
@@ -673,6 +679,10 @@ DEFAULT_CONFIG = {
     # Each task is independent — main-agent provider_routing and openrouter.min_coding_score
     # do NOT propagate to aux calls by design.
     "auxiliary": {
+        # Per-role overrides use the existing provider/credential resolution.
+        **{f"graph_{role}": _aux(120) for role in (
+            "intake", "direct", "architect", "tech_lead", "planner", "executor", "researcher", "reviewer", "repair"
+        )},
         # Same-provider retries for a transient blip (reset/timeout/5xx/408) on ANY aux call before
         # falling back; clamped [0,6]. Matters for pinned calls (MoA advisors) where provider
         # fallback is not meaningful recovery.

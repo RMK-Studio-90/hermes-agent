@@ -2182,6 +2182,10 @@ class CLICommandsMixin:
         _cp(f"  {format_dispatch_note(result, prompt)}")
 
     # ---- /goal, /loop, /subgoal -----------------------------------------------------------
+    def _handle_graph_command(self, cmd: str) -> None:
+        """Enter the shared, tool-free graph clarification turn."""
+        self._queue_prompt_turn(cmd, "/graph")
+
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / wait / status / pause / resume / clear."""
         arg = _command_arg(cmd)

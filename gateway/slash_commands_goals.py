@@ -34,6 +34,15 @@ def _mgr_call(prefix: str, fn, *args, errors=(RuntimeError, ValueError)):
 class GatewayGoalCommandsMixin:
     """Autonomy-loop gateway commands: /goal, /subgoal, /heartbeat, /loop, /refine, /review."""
 
+    async def _handle_graph_command(self, event: MessageEvent) -> str:
+        from agent.graph.intake import Intake
+        from agent.runtime_cwd import scope_terminal_cwd
+        entry = await self._session_entry_for_manager(event, "Graph")
+        if entry is None:
+            return "Graph benötigt eine aktive Sitzung."
+        return await Intake(entry.session_id).handle("/graph " + (event.get_command_args() or ""),
+                                                    cwd=scope_terminal_cwd() or None)
+
     async def _handle_goal_command(self, event: MessageEvent) -> str:
         """Handle /goal: status / show / unwait / clear / pause / resume / wait / gate / <new goal>.
 
