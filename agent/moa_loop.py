@@ -1083,8 +1083,17 @@ class MoAChatCompletions:
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
         agg_runtime = _slot_runtime(aggregator)
+        # Prepared requests bypass the primary transport's message conversion.
+        # Apply the destination's existing sanitizer before cache planning so
+        # durable timestamps/DB markers cannot reach strict chat gateways.
+        prepared_messages = prepared["messages"]
+        if agg_runtime.get("api_mode", "chat_completions") == "chat_completions":
+            from agent.transports.chat_completions import ChatCompletionsTransport
+            prepared_messages = ChatCompletionsTransport().convert_messages(
+                prepared_messages, model=aggregator.get("model")
+            )
         agg_messages, tools = self._plan_aggregator_cache(
-            prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
+            prepared_messages, api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
         trace = self._pending_trace
         if trace is not None:
