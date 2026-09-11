@@ -123,12 +123,23 @@ class MyMemoryProvider(MemoryProvider):
 |--------|-----------|----------|
 | `system_prompt_block()` | System prompt assembly | Static provider info |
 | `prefetch(query, *, session_id="")` | Before each API call | Return recalled context |
+| `take_tool_context(query, *, session_id="")` | After prefetch, before turn persistence | Opt-in automatic tool-result context |
 | `queue_prefetch(query, *, session_id="")` | After each turn | Pre-warm for next turn |
 | `sync_turn(user, assistant, *, session_id="", messages=None)` | After each completed turn | Persist conversation |
 | `on_session_end(messages)` | Conversation ends | Final extraction/flush |
 | `on_pre_compress(messages)` | Before context compression | Save insights before discard |
 | `on_memory_write(action, target, content)` | Built-in memory writes | Mirror to your backend |
 | `shutdown()` | Process exit | Clean up connections |
+
+Providers that require memory to remain separate from user input may return an empty
+string from `prefetch()` and cache their result. `take_tool_context()` consumes that
+already-prefetched result without network I/O and returns `{"name": "provider_tool",
+"arguments": {"query": query}, "content": "evidence"}` or `None`. The name must be an
+exposed provider tool. The host appends and persists a matching assistant tool call
+and tool result before the model request. Historical messages and system-prompt
+bytes remain unchanged. Content is bounded to 32,000 UTF-8 bytes by the host; the
+provider must apply its own smaller relevance and token budget. Disabled memory
+toolsets do not consume this context. Existing providers retain their behavior.
 
 ## Pre-Compress Checkpoints (fail-closed)
 

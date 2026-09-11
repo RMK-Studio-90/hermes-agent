@@ -893,6 +893,8 @@ def build_turn_context(
             plugin_user_context, preflight_compressed=compaction.compressed,
         )
 
+    from agent.memory_tool_context import append_memory_tool_context
+    append_memory_tool_context(agent, messages, original_user_message)
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
     # Title the session now: the row exists and titling depends only on the user's ask,
