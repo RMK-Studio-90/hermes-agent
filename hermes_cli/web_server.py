@@ -13314,22 +13314,38 @@ def _get_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: int = 20):
-    """Run sessions produced by a cron job, newest first.
+    """Unified run history for a cron job, newest first.
 
-    Cron runs are stored as ordinary sessions whose id is
-    ``cron_{job_id}_{timestamp}`` (see cron/scheduler.run_job). A job's history
-    is therefore every session whose id carries that prefix; ``source='cron'``
-    narrows it and the id prefix binds it to this job. Powers the run-history
-    list under each job in the desktop cron detail. Same row shape as
-    ``/api/sessions`` so the frontend can reuse SessionInfo.
+    ``cron/executions.db`` (``cron.executions``) is the CANONICAL execution
+    ledger — it records EVERY attempt for both agent jobs and ``no_agent``
+    script jobs. Script jobs short-circuit in ``cron.scheduler.run_job`` before
+    any ``SessionDB`` is constructed, so they never create a ``cron_{job_id}_*``
+    session row; reading run history from sessions alone made them show
+    "No runs yet" forever despite firing and writing output artifacts. This
+    endpoint therefore spines the history on the ledger and enriches each
+    execution with:
 
-    Backed by ``SessionDB.list_cron_job_runs`` — a bounded ``[prefix, hi)``
-    id-range scan, not the compression-chain CTE used for the recents list,
-    so the cost scales with the requested window and not the (unbounded) total
-    cron history.
+    * its agent session (when one exists — keeps the row openable and carries
+      the title/preview/token counts, same ``SessionInfo`` shape as
+      ``/api/sessions``),
+    * its durable failure incident (``cron.incidents``), and
+    * its output artifact (``cron/output/<job_id>/<ts>.md``).
+
+    Agent sessions with no matching ledger row (legacy runs predating the
+    ledger) are preserved so existing SessionDB history stays readable.
+
+    All four sources are read UNDER the selected profile's home override so a
+    job that runs under profile ``rmk-intel`` reads that profile's ledger,
+    sessions, incidents, and output — never the root/default store.
+
+    The session scan is still ``SessionDB.list_cron_job_runs`` (a bounded
+    ``[prefix, hi)`` id-range scan), and the ledger scan is indexed on
+    ``(job_id, claimed_at)``, so cost scales with the requested window rather
+    than total cron history. Merge/correlation is a pure function in
+    ``cron.run_history.build_run_history``.
     """
     selected = profile or _find_cron_job_profile(job_id)
-    # job_id may be a human name; resolve to the canonical id used in run-session ids.
+    # job_id may be a human name; resolve to the canonical id used in run ids.
     canonical = job_id
     if selected:
         job = _call_cron_for_profile(selected, "get_job", job_id)
@@ -13341,21 +13357,70 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
+    from cron.run_history import build_run_history, parse_output_filename_epoch
+
+    # ── Agent sessions (may be empty for script jobs) ──
     db = _open_session_db_for_profile(selected, read_only=True)
     try:
-        runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
-        now = time.time()
-        for s in runs:
-            s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
-            )
-            s["archived"] = bool(s.get("archived"))
-            if selected:
-                s["profile"] = selected
-        return {"runs": runs, "limit": limit_n}
+        sessions = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
     finally:
         db.close()
+
+    # ── Ledger + incidents + output artifacts, all under the profile home ──
+    # A bounded window: ask the ledger for more than ``limit_n`` so a burst of
+    # failures between successful runs cannot starve the merged page, but stay
+    # capped so the scan never walks the full (pruned to 1000) ledger.
+    _name, home = _cron_profile_home(selected)
+    from cron import jobs as cron_jobs
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    executions: List[Dict[str, Any]] = []
+    incidents: List[Dict[str, Any]] = []
+    output_files: List[Tuple[float, str]] = []
+    token = set_hermes_home_override(str(home))
+    try:
+        with cron_jobs.use_cron_store(home):
+            try:
+                from cron.executions import list_executions
+
+                executions = list_executions(
+                    job_id=canonical, limit=max(limit_n * 3, 50)
+                )
+            except Exception:
+                _log.debug("cron run history: ledger read failed", exc_info=True)
+            try:
+                from cron.incidents import list_incidents
+
+                incidents = list_incidents()
+            except Exception:
+                _log.debug("cron run history: incident read failed", exc_info=True)
+            try:
+                job_out_dir = cron_jobs.get_cron_output_dir() / canonical
+                if job_out_dir.is_dir():
+                    for entry in job_out_dir.glob("*.md"):
+                        epoch = parse_output_filename_epoch(entry.name)
+                        if epoch is not None:
+                            output_files.append((epoch, str(entry)))
+            except Exception:
+                _log.debug("cron run history: output scan failed", exc_info=True)
+    finally:
+        reset_hermes_home_override(token)
+
+    runs = build_run_history(
+        job_id=canonical,
+        executions=executions,
+        sessions=sessions,
+        incidents=incidents,
+        output_files=output_files,
+        limit=limit_n,
+    )
+    if selected:
+        for r in runs:
+            r["profile"] = selected
+    return {"runs": runs, "limit": limit_n}
 
 
 

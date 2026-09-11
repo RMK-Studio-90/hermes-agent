@@ -92,6 +92,31 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+# BUILD-01: lazy-imported to keep top-level import order clean and avoid
+# a circular import (config.py is also imported by kanban_db callers).
+# ``check_config_version`` is cheap and pure (reads config.yaml + the
+# DEFAULT_CONFIG constant), so a deferred lookup is safe.
+_check_config_version = None
+
+def _b01_config_version() -> str:
+    """Return the on-disk ``_config_version`` (e.g. ``"40"``) as a string.
+
+    Wrapped in a tiny lazy-import helper so the BUILD-01 instrumentation
+    code stays decoupled from the order in which ``hermes_cli.config`` is
+    initialised. Returns ``"unknown"`` if the version cannot be read —
+    K07 requires UNKNOWN to be distinct from zero, never silently
+    promoted to ``"0"``.
+    """
+    global _check_config_version
+    if _check_config_version is None:
+        from hermes_cli.config import check_config_version as _ccv
+        _check_config_version = _ccv
+    try:
+        current, _latest = _check_config_version()
+        return str(current) if current is not None else "unknown"
+    except Exception:  # pragma: no cover - defensive only
+        return "unknown"
+
 _log = logging.getLogger(__name__)
 
 
@@ -1524,6 +1549,126 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+
+-- ---------------------------------------------------------------------------
+-- BUILD-02 (Evaluation Event + Reflection Record stores)
+-- Canonical source: K09 §6.2 (BUILD-02), K05 §6.2/§4.3/§6.3.
+-- Additive tables only; legacy boards get them via _migrate_add_optional_columns.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS evaluation_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- K05 envelope REQUIRED (line 186)
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'evaluation_event'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    status                TEXT    NOT NULL CHECK (status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    -- K05 §6.2 data REQUIRED (line 429)
+    eval_run_id           TEXT    NOT NULL,
+    suite                 TEXT    NOT NULL,
+    case_ref              TEXT    NOT NULL,
+    criterion_ref         TEXT    NOT NULL,
+    verdict               TEXT    NOT NULL CHECK (verdict IN (
+        'pass','fail','inconclusive','blocked')),
+    subject_model         TEXT    NOT NULL,
+    subject_provider      TEXT    NOT NULL,
+    -- BUILD-02 correlation spine (BUILD-01)
+    run_id                INTEGER NOT NULL,   -- task_runs.id; enforced app-level
+    -- K05 §6.2 data OPTIONAL
+    score                 REAL,
+    judge                 TEXT,
+    tokens_input          INTEGER,
+    tokens_output         INTEGER,
+    data_latency_ms       INTEGER,
+    subject_prompt_version TEXT,
+    subject_config_version INTEGER,
+    hard_fail_classes     TEXT,   -- JSON array ["HF-01",...]
+    data_evidence_refs    TEXT,   -- JSON array
+    -- K05 envelope OPTIONAL fields
+    execution_id          TEXT,
+    task_id               TEXT,
+    session_id            TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,  -- envelope latency
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,    -- $.error (envelope path)
+    data_error_json       TEXT,    -- $.data.error (data path)
+    created_at            INTEGER NOT NULL,
+    UNIQUE (suite, eval_run_id)   -- K05 "suite-local unique id"
+);
+CREATE INDEX IF NOT EXISTS idx_eval_events_run    ON evaluation_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_eval_events_case   ON evaluation_events(suite, case_ref);
+CREATE INDEX IF NOT EXISTS idx_eval_events_ts     ON evaluation_events(timestamp);
+
+CREATE TABLE IF NOT EXISTS reflection_records (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- K05 envelope REQUIRED
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'reflection_record'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    event_status          TEXT    NOT NULL CHECK (event_status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    -- K05 §6.3 data REQUIRED (line 496)
+    scope                 TEXT    NOT NULL CHECK (scope IN (
+        'memory','skill','invariant','process','security')),
+    finding               TEXT    NOT NULL,
+    reflection_status     TEXT    NOT NULL CHECK (reflection_status IN (
+        'captured','triaged','resolved','actioned','dismissed')),
+    -- BUILD-02 correlation (nullable per §6.3)
+    run_id                INTEGER,
+    task_id               TEXT,
+    session_id            TEXT,   -- $.session_id (envelope)
+    -- K05 envelope OPTIONAL
+    execution_id          TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,    -- $.error (envelope)
+    -- K05 §6.3 data OPTIONAL
+    turn_ref              TEXT,
+    suggested_action      TEXT,
+    severity              TEXT    CHECK (severity IS NULL OR
+        severity IN ('info','low','medium','high','critical')),
+    data_session_id       TEXT,    -- $.data.session_id (data-level)
+    data_evidence_refs    TEXT,
+    data_source_event_ids TEXT,
+    data_error_json       TEXT,    -- $.data.error (data path)
+    created_at            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refl_run           ON reflection_records(run_id);
+CREATE INDEX IF NOT EXISTS idx_refl_ts            ON reflection_records(timestamp);
 """
 
 
@@ -2719,6 +2864,170 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # ---------------------------------------------------------------------
+    # BUILD-01 (Telemetry / Correlation Foundations) additive migration
+    # ---------------------------------------------------------------------
+    # Per K05/K09: the K05 ``execution_id`` field is logically mapped to
+    # the existing INTEGER ``task_runs.id`` (no separate TEXT column, no
+    # second ID spine — task_runs.id is the canonical run/execution
+    # spine). K05 ``config_version`` and K05 ``latency_ms`` live as
+    # additive, nullable task_runs columns so the envelope fields are
+    # indexable via plain SQL. K05 ``schema_version`` and K05
+    # ``cost_state`` live inside the existing ``task_runs.metadata`` JSON
+    # payload (rarely queried, low-cardinality) — written by the
+    # runtime-instrumentation helpers below; defaults are documented in
+    # §K09-B01-1 (BUILD-01 follow-up).
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "latency_ms" not in run_cols:
+        # Wall-clock duration of the run in milliseconds, computed at
+        # close time. Nullable on legacy rows: pre-BUILD-01 runs never
+        # recorded this value and cannot reconstruct it retroactively
+        # (SQLite only stores integer seconds, and started_at may have
+        # been patched by reclaim recovery). Documented in K09 §6.1.
+        _add_column_if_missing(
+            conn, "task_runs", "latency_ms", "latency_ms INTEGER"
+        )
+    if "config_version" not in run_cols:
+        # Schema version of the running hermes config (matches
+        # ``_config_version`` in config.yaml) at the time the run was
+        # claimed. NULL on legacy rows. Used to correlate run behavior
+        # with config-driven routing changes for post-incident review.
+        _add_column_if_missing(
+            conn, "task_runs", "config_version", "config_version TEXT"
+        )
+    # Indexes over additive ``task_runs`` columns must be created after
+    # the columns exist — same ordering rule as ``tasks`` indexes above.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_config_version "
+        "ON task_runs(config_version)"
+    )
+
+    # ---------------------------------------------------------------------
+    # BUILD-02 (Evaluation Events + Reflection Records) additive migration
+    # ---------------------------------------------------------------------
+    # Per K09 §6.2: evaluation_events (K05 D-04) and reflection_records
+    # (K05 D-05) tables. Both are additive; no changes to existing tables.
+    # SCHEMA_SQL already contains the CREATE statements for a fresh board;
+    # this block ensures a legacy board without them gets them added
+    # idempotently.
+    conn.execute("""CREATE TABLE IF NOT EXISTS evaluation_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'evaluation_event'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    status                TEXT    NOT NULL CHECK (status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    eval_run_id           TEXT    NOT NULL,
+    suite                 TEXT    NOT NULL,
+    case_ref              TEXT    NOT NULL,
+    criterion_ref         TEXT    NOT NULL,
+    verdict               TEXT    NOT NULL CHECK (verdict IN (
+        'pass','fail','inconclusive','blocked')),
+    subject_model         TEXT    NOT NULL,
+    subject_provider      TEXT    NOT NULL,
+    run_id                INTEGER NOT NULL,
+    score                 REAL,
+    judge                 TEXT,
+    tokens_input          INTEGER,
+    tokens_output         INTEGER,
+    data_latency_ms       INTEGER,
+    subject_prompt_version TEXT,
+    subject_config_version INTEGER,
+    hard_fail_classes     TEXT,
+    data_evidence_refs    TEXT,
+    execution_id          TEXT,
+    task_id               TEXT,
+    session_id            TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,
+    data_error_json       TEXT,
+    created_at            INTEGER NOT NULL,
+    UNIQUE (suite, eval_run_id)
+)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_run "
+        "ON evaluation_events(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_case "
+        "ON evaluation_events(suite, case_ref)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_ts "
+        "ON evaluation_events(timestamp)"
+    )
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS reflection_records (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'reflection_record'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    event_status          TEXT    NOT NULL CHECK (event_status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    scope                 TEXT    NOT NULL CHECK (scope IN (
+        'memory','skill','invariant','process','security')),
+    finding               TEXT    NOT NULL,
+    reflection_status     TEXT    NOT NULL CHECK (reflection_status IN (
+        'captured','triaged','resolved','actioned','dismissed')),
+    run_id                INTEGER,
+    task_id               TEXT,
+    session_id            TEXT,
+    execution_id          TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,
+    turn_ref              TEXT,
+    suggested_action      TEXT,
+    severity              TEXT    CHECK (severity IS NULL OR
+        severity IN ('info','low','medium','high','critical')),
+    data_session_id       TEXT,
+    data_evidence_refs    TEXT,
+    data_source_event_ids TEXT,
+    data_error_json       TEXT,
+    created_at            INTEGER NOT NULL
+)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refl_run "
+        "ON reflection_records(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refl_ts "
+        "ON reflection_records(timestamp)"
+    )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2795,20 +3104,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ).fetchall()
             for row in inflight:
                 started = row["started_at"] or int(time.time())
+                # BUILD-01: stamp config_version on the back-filled run
+                # row so the synthetic run carries the same envelope
+                # correlation as a freshly-claimed one.
+                _b01_cfg = _b01_config_version()
                 cur = conn.execute(
                     """
                     INSERT INTO task_runs (
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
-                        started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                        started_at, config_version
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
-                        started,
+                        started, _b01_cfg,
                     ),
                 )
                 # CAS: only install the pointer if nothing else claimed
@@ -3049,6 +3362,452 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
                 raise
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
+
+
+# ---------------------------------------------------------------------------
+# BUILD-02: Evaluation event + Reflection record write helpers
+# ---------------------------------------------------------------------------
+# These functions insert into the two new additive tables. All writes are
+# gated by pure-Python validators from hermes_cli.eval_schema. No feature
+# flag is introduced; rollback is git revert + DROP TABLE.
+
+class RefusedError(Exception):
+    """Raised when a BUILD-02 payload is rejected by a hard validation rule."""
+
+
+from hermes_cli.eval_schema import (
+    VALIDATOR_REGISTRY,
+    validate_evaluation_event as _validate_eval,
+    validate_reflection_record as _validate_refl,
+    event_fingerprint,
+    CANONICAL_ENVELOPE_STATUS,
+    CANONICAL_VERDICT,
+    CANONICAL_REFLECTION_STATUS,
+    CANONICAL_REFLECTION_SCOPE,
+)
+
+
+# Canonical ordered column list for evaluation_events, EXCLUDING the
+# AUTOINCREMENT `id`. This is the single source of truth for the INSERT:
+# column list, named placeholders, and the parameter dict are all derived
+# from it programmatically -- no manually counted '?' sequence anywhere.
+# Must match PRAGMA table_info(evaluation_events) minus 'id' exactly
+# (verified by _verify_eval_schema_once at first use per connection).
+_EVAL_EVENT_COLUMNS: tuple = (
+    "schema_version", "event_id", "event_type", "timestamp",
+    "config_version", "status",
+    "eval_run_id", "suite", "case_ref", "criterion_ref", "verdict",
+    "subject_model", "subject_provider",
+    "run_id",
+    "score", "judge", "tokens_input", "tokens_output", "data_latency_ms",
+    "subject_prompt_version", "subject_config_version",
+    "hard_fail_classes", "data_evidence_refs",
+    "execution_id", "task_id", "session_id", "parent_run_id",
+    "agent_profile", "model", "provider",
+    "prompt_version_hash", "prompt_version_revision",
+    "tool_name", "latency_ms", "evidence_refs", "artifact_hashes",
+    "source_event_ids", "supersedes_event_id",
+    "cost_json", "review_json", "parent_version_json", "error_json",
+    "data_error_json", "created_at",
+)
+
+_EVAL_EVENT_INSERT_SQL = (
+    "INSERT INTO evaluation_events (" + ", ".join(_EVAL_EVENT_COLUMNS) + ") "
+    "VALUES (" + ", ".join(f":{c}" for c in _EVAL_EVENT_COLUMNS) + ")"
+)
+
+_EVAL_JSON_COLUMNS = frozenset((
+    "hard_fail_classes", "data_evidence_refs", "evidence_refs",
+    "artifact_hashes", "source_event_ids", "cost_json", "review_json",
+    "parent_version_json", "error_json", "data_error_json",
+))
+
+_eval_schema_verified: set = set()
+
+
+def _verify_eval_schema_once(conn: sqlite3.Connection) -> None:
+    """Fail closed if evaluation_events' live DDL drifts from the canonical
+    column list. Runs once per connection (cheap PRAGMA, cached by id())."""
+    key = id(conn)
+    if key in _eval_schema_verified:
+        return
+    live_cols = [
+        row[1] for row in conn.execute("PRAGMA table_info(evaluation_events)")
+        if row[1] != "id"
+    ]
+    if list(live_cols) != list(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            "SCHEMA_CONTRACT_MISMATCH: evaluation_events live columns "
+            f"{live_cols!r} != canonical _EVAL_EVENT_COLUMNS "
+            f"{list(_EVAL_EVENT_COLUMNS)!r}"
+        )
+    _eval_schema_verified.add(key)
+
+
+def _eval_payload_to_params(payload: dict) -> dict:
+    """Serialize a payload dict to the exact named-parameter set the INSERT
+    needs, deterministically derived from _EVAL_EVENT_COLUMNS -- never a
+    manually counted tuple. Fails closed (before touching sqlite) if the
+    payload doesn't exactly cover the canonical column set."""
+    missing = [c for c in _EVAL_EVENT_COLUMNS if c not in payload]
+    if missing:
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: payload missing columns {missing}"
+        )
+    extra = [k for k in payload if k not in _EVAL_EVENT_COLUMNS]
+    if extra:
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: payload has undeclared columns {extra}"
+        )
+    if len(set(_EVAL_EVENT_COLUMNS)) != len(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            "INTERNAL_INVARIANT_VIOLATION: duplicate column name in "
+            "_EVAL_EVENT_COLUMNS"
+        )
+    params = {}
+    for col in _EVAL_EVENT_COLUMNS:
+        val = payload[col]
+        if col in _EVAL_JSON_COLUMNS and val is not None:
+            val = json.dumps(val, ensure_ascii=False)
+        params[col] = val
+    if len(params) != len(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: parameter count {len(params)} != "
+            f"column count {len(_EVAL_EVENT_COLUMNS)}"
+        )
+    return params
+
+
+def record_evaluation_event(
+    conn: sqlite3.Connection,
+    *,
+    # envelope
+    event_id: str,
+    timestamp: str,
+    status: str,
+    # data
+    eval_run_id: str,
+    suite: str,
+    case_ref: str,
+    criterion_ref: str,
+    verdict: str,
+    subject_model: str,
+    subject_provider: str,
+    config_version: Optional[int] = None,
+    # optional envelope
+    run_id: Optional[int] = None,
+    execution_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    prompt_version_hash: Optional[str] = None,
+    prompt_version_revision: Optional[int] = None,
+    tool_name: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    evidence_refs: Optional[list] = None,
+    artifact_hashes: Optional[dict] = None,
+    source_event_ids: Optional[list] = None,
+    supersedes_event_id: Optional[str] = None,
+    cost_json: Optional[dict] = None,
+    review_json: Optional[dict] = None,
+    parent_version_json: Optional[dict] = None,
+    error_json: Optional[dict] = None,
+    # optional data
+    score: Optional[float] = None,
+    judge: Optional[str] = None,
+    tokens_input: Optional[int] = None,
+    tokens_output: Optional[int] = None,
+    data_latency_ms: Optional[int] = None,
+    subject_prompt_version: Optional[str] = None,
+    subject_config_version: Optional[int] = None,
+    hard_fail_classes: Optional[list] = None,
+    data_evidence_refs: Optional[list] = None,
+    data_error_json: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Insert a canonical EvaluationEvent (K05 §6.2) into evaluation_events.
+
+    Validates against K05 §6.2 and §4.3 before writing. Returns the row id
+    on success, or the existing row id on idempotent retry (identical
+    canonical payload). Raises ``RefusedError`` on hard validation failure.
+
+    Idempotency rules:
+      - Composite key (suite, eval_run_id), same fingerprint → return existing id
+      - Key collision + divergent payload → RefusedError
+      - Same event_id + different key → RefusedError
+    """
+    import time as _time
+
+    ok, reason = _validate_eval(
+        schema_version=1, event_id=event_id, event_type="evaluation_event",
+        timestamp=timestamp, config_version=config_version if config_version is not None else -1,
+        status=status,
+        eval_run_id=eval_run_id, suite=suite, case_ref=case_ref,
+        criterion_ref=criterion_ref, verdict=verdict,
+        subject_model=subject_model, subject_provider=subject_provider,
+        score=score, evidence_refs=evidence_refs,
+    )
+    if not ok:
+        raise RefusedError(reason)
+
+    # K05 E-14: envelope config_version is NOT NULL (§4.3 required, minimum 1)
+    if config_version is None or config_version < 1:
+        raise RefusedError(
+            f"config_version must be an integer >= 1 (K05 §4.3 required, E-14), got {config_version!r}"
+        )
+
+    # K05 E-05 + BUILD-02 correlation spine: run_id is REQUIRED for
+    # evaluation_events and must reference an existing task_runs.id.
+    # Fail closed before the INSERT (FK-style check).
+    if run_id is None:
+        raise RefusedError("run_id is required for evaluation_events (K05 §6.2 correlation spine)")
+    _run_exists = conn.execute(
+        "SELECT id FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if _run_exists is None:
+        raise RefusedError(f"orphan run_id {run_id}: no matching task_runs.id")
+
+    now = int(_time.time())
+    if created_at is None:
+        created_at = now
+
+    payload = {
+        "schema_version": 1, "event_id": event_id,
+        "event_type": "evaluation_event", "timestamp": timestamp,
+        "config_version": config_version, "status": status,
+        "eval_run_id": eval_run_id, "suite": suite, "case_ref": case_ref,
+        "criterion_ref": criterion_ref, "verdict": verdict,
+        "subject_model": subject_model, "subject_provider": subject_provider,
+        "run_id": run_id,
+        "score": score, "judge": judge,
+        "subject_prompt_version": subject_prompt_version,
+        "subject_config_version": subject_config_version,
+        "hard_fail_classes": hard_fail_classes,
+    }
+    fp = event_fingerprint(payload)
+
+    with write_txn(conn, allow_nested=True):
+        # Check composite key
+        existing = conn.execute(
+            "SELECT id, event_id, eval_run_id, suite, case_ref, criterion_ref, verdict, "
+            "subject_model, subject_provider, status, event_type, timestamp, "
+            "config_version, run_id, score, judge, subject_prompt_version, "
+            "subject_config_version, hard_fail_classes, schema_version "
+            "FROM evaluation_events WHERE suite = ? AND eval_run_id = ?",
+            (suite, eval_run_id)
+        ).fetchone()
+        if existing is not None:
+            # Build fingerprint of the existing row using the SAME canonical
+            # field subset and pre-serialization form as the incoming payload.
+            existing_raw = {k: existing[k] for k in existing.keys()}
+            # JSON columns in the DB are stored serialized; round-trip hard_fail_classes
+            if existing_raw.get("hard_fail_classes") is not None:
+                existing_raw["hard_fail_classes"] = json.loads(existing_raw["hard_fail_classes"])
+            existing_fp = event_fingerprint(existing_raw)
+            if existing_fp == fp:
+                return int(existing[0])
+            # Same key, different payload — hard reject
+            if existing["event_id"] != event_id:
+                raise RefusedError(
+                    f"event_id collision: incoming '{event_id}' vs existing "
+                    f"'{existing['event_id']}' on key (suite={suite}, "
+                    f"eval_run_id={eval_run_id})"
+                )
+            raise RefusedError(
+                f"evaluation event conflict on (suite={suite}, "
+                f"eval_run_id={eval_run_id}): canonical payload diverges "
+                f"(existing event_id='{existing['event_id']}')"
+            )
+
+        check = conn.execute(
+            "SELECT id FROM evaluation_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if check is not None:
+            raise RefusedError(
+                f"event_id '{event_id}' already exists for different key "
+                f"(event_id is globally unique)"
+            )
+
+        _verify_eval_schema_once(conn)
+
+        # Build parameter dict in canonical column order (derived from
+        # _EVAL_EVENT_COLUMNS, not manually counted)
+        full_payload = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "event_type": "evaluation_event",
+            "timestamp": timestamp,
+            "config_version": config_version,
+            "status": status,
+            "eval_run_id": eval_run_id,
+            "suite": suite,
+            "case_ref": case_ref,
+            "criterion_ref": criterion_ref,
+            "verdict": verdict,
+            "subject_model": subject_model,
+            "subject_provider": subject_provider,
+            "run_id": run_id,
+            "score": score,
+            "judge": judge,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "data_latency_ms": data_latency_ms,
+            "subject_prompt_version": subject_prompt_version,
+            "subject_config_version": subject_config_version,
+            "hard_fail_classes": hard_fail_classes,
+            "data_evidence_refs": data_evidence_refs,
+            "execution_id": execution_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "parent_run_id": parent_run_id,
+            "agent_profile": agent_profile,
+            "model": model,
+            "provider": provider,
+            "prompt_version_hash": prompt_version_hash,
+            "prompt_version_revision": prompt_version_revision,
+            "tool_name": tool_name,
+            "latency_ms": latency_ms,
+            "evidence_refs": evidence_refs,
+            "artifact_hashes": artifact_hashes,
+            "source_event_ids": source_event_ids,
+            "supersedes_event_id": supersedes_event_id,
+            "cost_json": cost_json,
+            "review_json": review_json,
+            "parent_version_json": parent_version_json,
+            "error_json": error_json,
+            "data_error_json": data_error_json,
+            "created_at": created_at,
+        }
+        params = _eval_payload_to_params(full_payload)
+
+        # Execute with the canonical SQL and verified parameter count
+        cur = conn.execute(_EVAL_EVENT_INSERT_SQL, params)
+        return int(cur.lastrowid)
+
+
+def record_reflection_record(
+    conn: sqlite3.Connection,
+    *,
+    # envelope
+    event_id: str,
+    timestamp: str,
+    event_status: str,
+    config_version: Optional[int] = None,
+    # data
+    scope: str,
+    finding: str,
+    reflection_status: str,
+    # optional envelope
+    run_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    prompt_version_hash: Optional[str] = None,
+    prompt_version_revision: Optional[int] = None,
+    tool_name: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    evidence_refs: Optional[list] = None,
+    artifact_hashes: Optional[dict] = None,
+    source_event_ids: Optional[list] = None,
+    supersedes_event_id: Optional[str] = None,
+    cost_json: Optional[dict] = None,
+    review_json: Optional[dict] = None,
+    parent_version_json: Optional[dict] = None,
+    error_json: Optional[dict] = None,
+    # optional data
+    turn_ref: Optional[str] = None,
+    suggested_action: Optional[str] = None,
+    severity: Optional[str] = None,
+    data_session_id: Optional[str] = None,
+    data_evidence_refs: Optional[list] = None,
+    data_source_event_ids: Optional[list] = None,
+    data_error_json: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Insert a canonical ReflectionRecord (K05 §6.3).
+
+    No business logic, no LLM calls, no pattern extraction — pure storage.
+    Returns the row id.
+    """
+    import time as _time
+
+    ok, reason = _validate_refl(
+        schema_version=1, event_id=event_id, event_type="reflection_record",
+        timestamp=timestamp, config_version=config_version if config_version is not None else -1,
+        event_status=event_status,
+        scope=scope, finding=finding, reflection_status=reflection_status,
+    )
+    if not ok:
+        raise RefusedError(reason)
+
+    if created_at is None:
+        created_at = int(_time.time())
+    if config_version is None:
+        config_version = -1
+
+    with write_txn(conn, allow_nested=True):
+        check = conn.execute(
+            "SELECT id FROM reflection_records WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if check is not None:
+            raise RefusedError(
+                f"reflection_record event_id '{event_id}' already exists"
+            )
+
+        cur = conn.execute(
+            """
+            INSERT INTO reflection_records (
+                schema_version, event_id, event_type, timestamp,
+                config_version, event_status, scope, finding,
+                reflection_status, run_id, task_id, session_id,
+                execution_id, parent_run_id, agent_profile, model,
+                provider, prompt_version_hash, prompt_version_revision,
+                tool_name, latency_ms, evidence_refs, artifact_hashes,
+                source_event_ids, supersedes_event_id, cost_json,
+                review_json, parent_version_json, error_json,
+                turn_ref, suggested_action, severity, data_session_id,
+                data_evidence_refs, data_source_event_ids, data_error_json,
+                created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                        ?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                1, event_id, "reflection_record", timestamp,
+                config_version, event_status, scope, finding,
+                reflection_status, run_id, task_id, session_id,
+                execution_id, parent_run_id, agent_profile, model,
+                provider, prompt_version_hash, prompt_version_revision,
+                tool_name, latency_ms,
+                json.dumps(evidence_refs, ensure_ascii=False)
+                    if evidence_refs else None,
+                json.dumps(artifact_hashes, ensure_ascii=False)
+                    if artifact_hashes else None,
+                json.dumps(source_event_ids, ensure_ascii=False)
+                    if source_event_ids else None,
+                supersedes_event_id,
+                json.dumps(cost_json, ensure_ascii=False) if cost_json else None,
+                json.dumps(review_json, ensure_ascii=False) if review_json else None,
+                json.dumps(parent_version_json, ensure_ascii=False)
+                    if parent_version_json else None,
+                json.dumps(error_json, ensure_ascii=False) if error_json else None,
+                turn_ref, suggested_action, severity, data_session_id,
+                json.dumps(data_evidence_refs, ensure_ascii=False)
+                    if data_evidence_refs else None,
+                json.dumps(data_source_event_ids, ensure_ascii=False)
+                    if data_source_event_ids else None,
+                json.dumps(data_error_json, ensure_ascii=False)
+                    if data_error_json else None,
+                created_at,
+            )
+        )
+        return int(cur.lastrowid)
 
 
 @contextlib.contextmanager
@@ -4358,6 +5117,39 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    # BUILD-01 (Telemetry / Correlation Foundations) — compute latency_ms
+    # at run-close. We use ``time.time() * 1000`` for the latency math
+    # (sub-second precision) so the BUILD-01 metric survives runs that
+    # finish inside a single wall-clock second. ended_at stays in
+    # seconds (existing schema invariant: ``ended_at`` is INTEGER
+    # seconds-since-epoch across all task_runs rows). If started_at is
+    # somehow NULL (legacy row, manual edit), latency_ms stays NULL —
+    # K09 §6.1 permits "missing historical fields represented as NULL".
+    now_ms = int(time.time() * 1000)
+    started_row = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    latency_ms = None
+    if started_row and started_row["started_at"]:
+        # started_at is in seconds; convert to ms before subtracting so
+        # the result has the same scale as ``now_ms``.
+        latency_ms = max(0, now_ms - int(started_row["started_at"]) * 1000)
+    # BUILD-01: merge K05 envelope fields (schema_version, cost_state)
+    # into the user-supplied metadata dict when caller did not pass one.
+    # User metadata is never overridden — K07 policy: ``cost_state =
+    # "unknown"`` is the honest default while K05 D-08/D-09 pricing
+    # state is UNKNOWN/TBD; ``schema_version`` records that the row
+    # was written after the BUILD-01 additive migration.
+    b01_meta = {
+        "schema_version": "kanban_v1.0",
+        "cost_state": "unknown",
+    }
+    if metadata:
+        merged_meta = dict(metadata)
+        for k, v in b01_meta.items():
+            merged_meta.setdefault(k, v)
+    else:
+        merged_meta = b01_meta
     conn.execute(
         """
         UPDATE task_runs
@@ -4366,6 +5158,7 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               latency_ms    = ?,
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
@@ -4378,7 +5171,8 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged_meta, ensure_ascii=False) if merged_meta else None,
+            latency_ms,
             now,
             run_id,
         ),
@@ -4433,18 +5227,40 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
-            started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, ended_at, latency_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(_synth_metadata_with_b01(metadata), ensure_ascii=False)
+                if _synth_metadata_with_b01(metadata) is not None else None,
             now, now,
+            0,  # synthetic: zero-duration
         ),
     )
     return int(cur.lastrowid or 0)
+
+
+def _synth_metadata_with_b01(metadata: Optional[dict]) -> Optional[dict]:
+    """Merge BUILD-01 K05 envelope defaults into a metadata dict for synthetic runs.
+
+    User metadata is never overridden. Returns ``None`` when the result is
+    empty so the caller's ``if ... else None`` short-circuits to NULL,
+    preserving the pre-BUILD-01 behaviour for callers that pass no
+    metadata. See K09 §6.1 + K05 §4 envelope defaults.
+    """
+    b01_defaults = {
+        "schema_version": "kanban_v1.0",
+        "cost_state": "unknown",
+    }
+    if metadata is None:
+        return b01_defaults
+    merged = dict(metadata)
+    for k, v in b01_defaults.items():
+        merged.setdefault(k, v)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -4675,16 +5491,30 @@ def claim_task(
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
+            # BUILD-01: also set latency_ms on the recovered run (same
+            # computation as _end_run). started_at may be NULL on legacy
+            # rows; latency_ms then stays NULL.
+            _stale_started = conn.execute(
+                "SELECT started_at FROM task_runs WHERE id = ?",
+                (int(stale["current_run_id"]),),
+            ).fetchone()
+            _stale_latency = None
+            if _stale_started and _stale_started["started_at"]:
+                _stale_latency = max(
+                    0,
+                    int(time.time() * 1000)
+                    - int(_stale_started["started_at"]) * 1000,
+                )
             conn.execute(
                 """
                 UPDATE task_runs
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
+                       ended_at = ?, latency_ms = ?,
                        claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
                  WHERE id = ? AND ended_at IS NULL
                 """,
-                (now, int(stale["current_run_id"])),
+                (now, _stale_latency, int(stale["current_run_id"])),
             )
         cur = conn.execute(
             """
@@ -4713,8 +5543,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, config_version
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4724,6 +5554,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                _b01_config_version(),
             ),
         )
         run_id = run_cur.lastrowid
@@ -4811,8 +5642,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, config_version
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4822,6 +5653,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                _b01_config_version(),
             ),
         )
         run_id = run_cur.lastrowid
@@ -6864,16 +7696,29 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
+        # BUILD-01: compute latency_ms for the reclaimed run (same
+        # logic as _end_run + claim-task reclaim). Stays NULL on legacy
+        # rows without started_at.
+        _b01_started = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id = ?",
+            (int(stale["current_run_id"]),),
+        ).fetchone()
+        _b01_latency = None
+        if _b01_started and _b01_started["started_at"]:
+            _b01_latency = max(
+                0,
+                int(time.time() * 1000) - int(_b01_started["started_at"]) * 1000,
+            )
         conn.execute(
             """
             UPDATE task_runs
                SET status = 'reclaimed', outcome = 'reclaimed',
                    summary = COALESCE(summary, ?),
-                   ended_at = ?,
+                   ended_at = ?, latency_ms = ?,
                    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
              WHERE id = ? AND ended_at IS NULL
             """,
-            (note, now, int(stale["current_run_id"])),
+            (note, now, _b01_latency, int(stale["current_run_id"])),
         )
 
 
