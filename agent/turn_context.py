@@ -789,6 +789,8 @@ def build_turn_context(
     set_session_context(agent.session_id)
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     agent._restore_primary_runtime()
+    from agent.routing.integration import prepare_turn_route
+    prepare_turn_route(agent, user_message, conversation_history)
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
 

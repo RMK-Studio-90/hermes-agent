@@ -2022,6 +2022,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     _arm_rate_limit_cooldown(agent, reason)
+    from agent.routing.integration import is_enabled
+    if is_enabled() and reason is not None:
+        from agent.routing.override import allows_fallback, resolve_override
+        if not allows_fallback(resolve_override(), reason):
+            return False
+    # Adaptive routing (config flag ``routing.adaptive.enabled``, default off):
+    # health-aware reorder of the UNWALKED fallback tail. It never adds/removes
+    # entries, is a no-op when the flag is off, and swallows every error — so the
+    # chain walk below is byte-identical to previous behaviour in the default config.
+    try:
+        from agent.routing.integration import reorder_fallback_chain
+        reorder_fallback_chain(agent, reason)
+    except Exception:
+        pass
     if agent._fallback_index >= len(agent._fallback_chain):
         return _fallback_chain_exhausted(agent, reason)
     fb = agent._fallback_chain[agent._fallback_index]
@@ -2032,6 +2046,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     unavailable = agent._unavailable_fallback_keys
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
+    if is_enabled() and (fb_provider, fb_model) not in getattr(agent, "_routing_allowed_routes", set()):
+        return agent._try_activate_fallback(reason)
     if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
         return agent._try_activate_fallback(reason)
 
@@ -2101,6 +2117,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._provider_fallback_active = True
         agent._provider_fallback_route = (str(fb_model), str(fb_provider))
         logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
+        from agent.routing.integration import note_route_change
+        note_route_change(agent, (old_provider, old_model), reason)
         # The stale-call streak measured the OLD provider; carrying it over would
         # short-circuit the fresh fallback before its first stream attempt.
         _reset_stale_streak(agent)

@@ -75,6 +75,43 @@ def record_response_usage(
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
     agent.session_api_calls += 1
+    from agent.routing.integration import is_enabled, note_outcome
+    if is_enabled():
+        req = getattr(agent, "_routing_required", None)
+        route_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode) if getattr(response, "usage", None) else None
+        note_outcome(agent.provider, agent.model, True,
+                     registry=getattr(getattr(agent, "_routing_runtime", None), "registry", None),
+                     history=getattr(getattr(agent, "_routing_runtime", None), "history", None),
+                     cap_class=req.cap_class() if req else "",
+                     latency_ms=api_duration * 1000, session_id=agent.session_id,
+                     token_usage={"input_tokens": route_usage.input_tokens,
+                                  "output_tokens": route_usage.output_tokens} if route_usage else None)
+        # Durable producer: write the route that actually returned this response.
+        # The JSONL/ring sink remains explainability output; state.db is the queryable
+        # source used by dashboards and diagnostics.
+        session_db = getattr(agent, "_session_db", None)
+        decision = getattr(agent, "_routing_decision", None)
+        if session_db is not None and getattr(agent, "session_id", None) and decision is not None:
+            try:
+                entry = getattr(__import__("agent.routing.registry", fromlist=["registry"]), "registry").get(
+                    agent.provider, agent.model)
+                session_db.record_routing_telemetry(
+                    agent.session_id, turn_index=agent.session_api_calls,
+                    task_requirements=getattr(agent, "_routing_required", None).__dict__
+                    if getattr(agent, "_routing_required", None) else {},
+                    candidates=(getattr(decision, "why", {}) or {}).get("ranked", []),
+                    rejection_reasons=(getattr(decision, "why", {}) or {}).get("rejected", []),
+                    selected_provider=str((getattr(decision, "route", None) or (agent.provider, ""))[0]),
+                    selected_model=str((getattr(decision, "route", None) or ("", agent.model))[1]),
+                    free_paid_route=entry.cost_tier if entry is not None else "unknown",
+                    fallback_attempts=int(getattr(agent, "_fallback_index", 0) or 0),
+                    final_model_used=agent.model, latency=api_duration,
+                    input_tokens=route_usage.input_tokens if route_usage else 0,
+                    output_tokens=route_usage.output_tokens if route_usage else 0,
+                )
+            except Exception:
+                logger.debug("routing telemetry state write failed", exc_info=True)
+        agent._routing_failure_recorded = None
     if not (hasattr(response, 'usage') and response.usage):
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the

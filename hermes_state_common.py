@@ -194,7 +194,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 32
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -386,6 +386,27 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     first_seen REAL,
     last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+);
+
+
+CREATE TABLE IF NOT EXISTS routing_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_index INTEGER NOT NULL,
+    task_requirements TEXT NOT NULL,  -- JSON
+    candidates TEXT NOT NULL,         -- JSON array of objects with model, provider
+    rejection_reasons TEXT NOT NULL,  -- JSON object mapping model:provider to reason
+    selected_provider TEXT NOT NULL,
+    selected_model TEXT NOT NULL,
+    free_paid_route TEXT NOT NULL,    -- 'free' or 'paid'
+    fallback_attempts INTEGER NOT NULL DEFAULT 0,
+    final_model_used TEXT NOT NULL,
+    latency REAL NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    failure_classification TEXT,
+    final_outcome TEXT NOT NULL,
+    timestamp REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (

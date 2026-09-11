@@ -2231,6 +2231,10 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Constructor model arguments are explicit pins; an omitted model permits
+    # adaptive selection from the configured primary/fallback routes.
+    agent._routing_explicit_model = bool(model)
+
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
         setattr(agent, _name, _params[_name])

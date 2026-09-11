@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -379,6 +380,50 @@ class SessionUsageMixin:
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         if not session_id or not task:
             return
+    def record_routing_telemetry(
+        self, session_id: str, *, turn_index: int, task_requirements: Dict[str, Any],
+        candidates: List[Dict[str, Any]], rejection_reasons: Dict[str, Any],
+        selected_provider: str, selected_model: str, free_paid_route: str,
+        fallback_attempts: int, final_model_used: str, latency: float,
+        input_tokens: int = 0, output_tokens: int = 0,
+        failure_classification: Optional[str] = None, final_outcome: str = "success",
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Persist the final route actually used for one adaptive-routing turn.
+
+        This narrow state-store API is called after provider outcome is known, so
+        ``final_model_used`` cannot describe merely a proposed candidate.
+        """
+        if not session_id:
+            return
+        self._insert_session_row(session_id, "unknown")
+        values = (
+            session_id, int(turn_index), json.dumps(task_requirements or {}, sort_keys=True),
+            json.dumps(candidates or [], sort_keys=True), json.dumps(rejection_reasons or {}, sort_keys=True),
+            str(selected_provider or ""), str(selected_model or ""), str(free_paid_route or "unknown"),
+            max(0, int(fallback_attempts)), str(final_model_used or ""), float(latency or 0.0),
+            int(input_tokens or 0), int(output_tokens or 0), failure_classification,
+            str(final_outcome or "unknown"), float(timestamp if timestamp is not None else time.time()),
+        )
+        self._execute_write(lambda conn: conn.execute(
+            """INSERT INTO routing_telemetry (
+                session_id, turn_index, task_requirements, candidates, rejection_reasons,
+                selected_provider, selected_model, free_paid_route, fallback_attempts,
+                final_model_used, latency, input_tokens, output_tokens,
+                failure_classification, final_outcome, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
+        ))
+
+    def routing_telemetry_recent(self, session_id: Optional[str] = None, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Read recent persisted routing rows for dashboards and diagnostics."""
+        limit = max(1, min(int(limit), 1000))
+        where = "WHERE session_id = ?" if session_id else ""
+        params = (session_id, limit) if session_id else (limit,)
+        rows = self._read_all(
+            f"SELECT * FROM routing_telemetry {where} ORDER BY timestamp DESC, id DESC LIMIT ?", params,
+        )
+        return [dict(row) for row in rows]
+
         usage["api_call_count"] = 1 if api_call_count is None else int(api_call_count)
         # FK to sessions.id: same INSERT OR IGNORE guard as update_token_counts.
         self._insert_session_row(session_id, "unknown")
