@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+# RMK Smart Model Router — operator CLI (read-only).
+#   rmk-router status
+#   rmk-router explain "<task>"
+# Thin wrapper over `python -m agent.routing`; see agent/routing/__main__.py.
+set -eu
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+if [ -x "$REPO/venv/Scripts/python.exe" ]; then
+  PY="$REPO/venv/Scripts/python.exe"
+elif [ -x "$REPO/venv/bin/python" ]; then
+  PY="$REPO/venv/bin/python"
+else
+  PY=${PYTHON:-python}
+fi
+cd "$REPO"
+exec "$PY" -m agent.routing "$@"
