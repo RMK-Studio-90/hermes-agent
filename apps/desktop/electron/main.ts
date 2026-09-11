@@ -11421,7 +11421,18 @@ async function ensureBackend(profile) {
     return connection
   }
 
-  evictLruPoolBackends(poolMaxBackends() - 1)
+  // Forensic + foreground preemption. A user opening a bot whose backend is
+  // not pooled must be able to CLAIM a slot: with >= maxBackends bots open the
+  // 60s renderer keepalive keeps every pooled backend inside the soft
+  // freshness window forever, so soft eviction frees nothing and the spawn
+  // below queues until POOL_SLOT_WAIT_MS and hard-fails — the Dev / Research /
+  // Review / Growth "does not open at all" bug. Foreground mode instead evicts
+  // the LRU backend that is merely idle (touched only by keepalive, not by a
+  // live turn) so this open gets its slot; a mid-turn backend is still spared.
+  const preempted = evictLruPoolBackends(poolMaxBackends() - 1, { foreground: true })
+  rememberLog(
+    `[pool] on-demand backend request for "${key}": ${localBackendSpawnCoordinator.activeCount}/${poolMaxBackends()} slots in use, ${localBackendSpawnCoordinator.queuedCount} queued, foreground preemption freed ${preempted}`
+  )
 
   const entry = {
     process: null,
@@ -11587,7 +11598,13 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return existingLocal.connectionPromise
     }
 
-    evictLruPoolBackends(poolMaxBackends() - 1)
+    // On-demand forced-local spawn (registry path) — same foreground slot
+    // claim as ensureBackend() above so a bot on the local registry source
+    // can't be locked out by a full, kept-alive pool.
+    const preemptedLocal = evictLruPoolBackends(poolMaxBackends() - 1, { foreground: true })
+    rememberLog(
+      `[pool] on-demand forced-local backend request for "${localRoute.poolKey}": ${localBackendSpawnCoordinator.activeCount}/${poolMaxBackends()} slots in use, ${localBackendSpawnCoordinator.queuedCount} queued, foreground preemption freed ${preemptedLocal}`
+    )
 
     const localEntry = {
       process: null,
@@ -12309,13 +12326,26 @@ function touchPoolBackend(profile) {
 // across N registered remote connections LRU-evict a REAL local backend that
 // was merely idle past the keepalive window. Descriptors are still reclaimed
 // by the idle reaper.
-function evictLruPoolBackends(keep) {
-  const evictions = selectPoolEvictions(backendPool.entries(), Math.max(0, keep), Date.now(), POOL_KEEPALIVE_FRESH_MS)
+function evictLruPoolBackends(keep, options: { foreground?: boolean } = {}) {
+  const foreground = options.foreground === true
+
+  const evictions = selectPoolEvictions(backendPool.entries(), Math.max(0, keep), Date.now(), POOL_KEEPALIVE_FRESH_MS, {
+    mode: foreground ? 'foreground' : 'soft',
+    // A foreground open must never take down the window's own primary backend
+    // to make room for a bot chat.
+    protect: [primaryProfileKey()]
+  })
 
   for (const profile of evictions) {
-    rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${poolMaxBackends()})`)
+    rememberLog(
+      foreground
+        ? `Preempting LRU idle profile backend "${profile}" to free a slot for a foreground open (cap ${poolMaxBackends()})`
+        : `Evicting idle profile backend "${profile}" (LRU cap ${poolMaxBackends()})`
+    )
     stopPoolBackend(profile)
   }
+
+  return evictions.length
 }
 
 function startPoolIdleReaper() {
@@ -12452,12 +12482,34 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   entry.localBackendSpawnRequest = spawnRequest
 
   if (localBackendSpawnCoordinator.activeCount >= poolMaxBackends()) {
+    const busy = [...backendPool.entries()]
+      .filter(([, e]) => Boolean(e.process))
+      .map(([k, e]) => `${k}(idle ${Math.round((Date.now() - (e.lastActiveAt || 0)) / 1000)}s)`)
+      .join(', ')
+
     rememberLog(
-      `Profile backend "${profile}" waiting for a free local slot (${localBackendSpawnCoordinator.activeCount}/${poolMaxBackends()} busy, ${localBackendSpawnCoordinator.queuedCount} queued)`
+      `Profile backend "${profile}" waiting for a free local slot (${localBackendSpawnCoordinator.activeCount}/${poolMaxBackends()} busy, ${localBackendSpawnCoordinator.queuedCount} queued); in-use: ${busy || 'none'}`
     )
   }
 
-  entry.releaseLocalBackendSlot = await spawnRequest.acquired
+  try {
+    entry.releaseLocalBackendSlot = await spawnRequest.acquired
+  } catch (error) {
+    // The only way here is the slot-wait timeout: every pooled backend was
+    // busy with an active turn (foreground preemption spares those), so none
+    // could be evicted to make room. Turn the generic timeout into an
+    // actionable message instead of a silent boot failure — the previous
+    // wording read as "gateway unreachable" and sent users chasing a
+    // network problem that did not exist.
+    if (error instanceof Error && /free slot/.test(error.message)) {
+      throw new Error(
+        `Can't open "${profile}" yet: all ${poolMaxBackends()} bot backends are busy with active turns. ` +
+          `Wait for one to finish, close a bot chat, or raise the limit in Settings → Advanced → Backend pool.`
+      )
+    }
+
+    throw error
+  }
 
   if (entry.localBackendSpawnRequest === spawnRequest) {
     entry.localBackendSpawnRequest = null

@@ -19,27 +19,58 @@ export interface PoolEvictionEntry {
   process?: unknown
 }
 
+export interface SelectPoolEvictionsOptions<K> {
+  /**
+   * 'soft' (default): background cap-convergence — spare any backend touched
+   * within `freshMs` (a kept-alive pool may exceed the soft cap rather than
+   * kill a running session; #95189).
+   *
+   * 'foreground': a user is opening a bot RIGHT NOW and the pool is at cap.
+   * The keepalive-fresh guard no longer applies — the renderer pings every
+   * open bot's backend every 60s, so with >= maxBackends bots open NOTHING is
+   * ever `freshMs`-stale and the click can never get a slot (the Dev /
+   * Research / Review / Growth "hard open failure"). Instead spare only a
+   * backend touched within `minIdleMs` (a running turn touches on every
+   * streamed chunk; an idle-but-kept-alive one only every 60s), so an LRU
+   * idle backend yields its slot to the bot being opened while a mid-turn
+   * one is left alone.
+   */
+  mode?: 'foreground' | 'soft'
+  /** foreground mode only: spare a backend touched within this window
+   *  (default 15s — comfortably longer than a turn's inter-token gap,
+   *  shorter than the 60s keepalive cadence). */
+  minIdleMs?: number
+  /** Never evict these keys (e.g. the primary profile). */
+  protect?: Iterable<K>
+}
+
 /**
  * Pick which pool keys the LRU cap should evict so that at most `keep`
  * SPAWNED backends remain. Only entries with a live child process count
- * toward the cap or are eligible for cap eviction, and — as before — only
- * entries idle beyond `freshMs` may be evicted (an actively kept-alive pool
- * may exceed the soft cap rather than kill a running session).
+ * toward the cap or are eligible for cap eviction. In the default 'soft'
+ * mode only entries idle beyond `freshMs` may be evicted; 'foreground' mode
+ * (a live user navigation that needs a slot now) relaxes that to `minIdleMs`
+ * so a kept-alive-but-idle backend yields its slot instead of the open
+ * failing outright. LRU order and the `keep` floor are identical in both.
  */
 export function selectPoolEvictions<K>(
   entries: Iterable<[K, PoolEvictionEntry]>,
   keep: number,
   now: number,
-  freshMs: number
+  freshMs: number,
+  options: SelectPoolEvictionsOptions<K> = {}
 ): K[] {
-  const spawned = [...entries].filter(([, entry]) => Boolean(entry.process))
+  const protectedKeys = new Set<K>(options.protect ?? [])
+  const spawned = [...entries].filter(([key, entry]) => Boolean(entry.process) && !protectedKeys.has(key))
 
   if (spawned.length <= keep) {
     return []
   }
 
+  const idleGate = options.mode === 'foreground' ? Math.max(0, options.minIdleMs ?? 15_000) : freshMs
+
   const evictable = spawned
-    .filter(([, entry]) => now - (entry.lastActiveAt || 0) > freshMs)
+    .filter(([, entry]) => now - (entry.lastActiveAt || 0) > idleGate)
     .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
 
   let removable = spawned.length - Math.max(0, keep)

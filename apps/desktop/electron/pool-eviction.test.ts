@@ -151,3 +151,88 @@ test('#95189: a backend genuinely idle for minutes IS evicted (#95189 long-windo
   // keep=1, idle is over the cap AND past the fresh window → evicted.
   assert.deepEqual(selectPoolEvictions(entries, 1, NOW, FRESH_MS), ['idle'])
 })
+
+// ── Foreground preemption — the Dev / Research / Review / Growth hard-open fix ──
+// With >= maxBackends bot backends open, the 60s renderer keepalive keeps EVERY
+// pooled backend inside the freshness window, so soft eviction frees nothing and
+// a click on a not-yet-pooled bot can never get a slot. Foreground mode evicts
+// the LRU backend that is only keepalive-fresh (not mid-turn) so the open
+// succeeds; a backend with recent turn activity is still spared.
+
+test('foreground: a keepalive-fresh but idle LRU backend is evicted where soft mode spares it', () => {
+  // Exactly the reported state: 3 pooled bot backends, each last touched only
+  // by the 30–50s keepalive ping, pool cap effectively 2 for the incoming open.
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['dev', spawned(50_000)],
+    ['research', spawned(40_000)],
+    ['review', spawned(30_000)]
+  ]
+
+  // Soft mode: all three are within FRESH_MS → nothing evicted → the 4th bot
+  // ("growth") queues and hard-fails. This is the bug.
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS), [])
+
+  // Foreground mode: the least-recently-touched backend yields its slot.
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS, { mode: 'foreground' }), ['dev'])
+})
+
+test('foreground: a backend touched within minIdleMs (mid-turn) is still spared', () => {
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['streaming-turn', spawned(3_000)], // a live turn touches every few seconds
+    ['idle-a', spawned(45_000)],
+    ['idle-b', spawned(40_000)]
+  ]
+
+  // keep=2 → one over cap. The mid-turn backend must NOT be the victim even
+  // though nothing is FRESH_MS-stale; the oldest merely-idle one is.
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS, { mode: 'foreground' }), ['idle-a'])
+})
+
+test('foreground: when every backend is mid-turn, nothing is evicted (open queues, then errors actionably)', () => {
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['turn-a', spawned(2_000)],
+    ['turn-b', spawned(4_000)],
+    ['turn-c', spawned(1_000)]
+  ]
+
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS, { mode: 'foreground' }), [])
+})
+
+test('foreground: evicts only enough to reach keep, LRU first', () => {
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['a', spawned(50_000)],
+    ['b', spawned(45_000)],
+    ['c', spawned(40_000)],
+    ['d', spawned(35_000)]
+  ]
+
+  // 4 spawned, keep 2 → remove exactly 2, oldest first.
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS, { mode: 'foreground' }), ['a', 'b'])
+})
+
+test('protect: a protected key (the primary) is never evicted and never counts toward the cap', () => {
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['default', spawned(90_000)], // primary — protected
+    ['dev', spawned(60_000)],
+    ['research', spawned(50_000)]
+  ]
+
+  // keep=2, foreground. Without protection the LRU 'default' would be picked;
+  // with it, only the two bot backends are candidates and neither needs to go
+  // (2 spawned candidates <= keep 2).
+  assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS, { mode: 'foreground', protect: ['default'] }), [])
+
+  // keep=1 → one bot backend must yield; still never the protected primary.
+  assert.deepEqual(selectPoolEvictions(entries, 1, NOW, FRESH_MS, { mode: 'foreground', protect: ['default'] }), ['dev'])
+})
+
+test('soft mode is unchanged when the new options arg is omitted or explicit', () => {
+  const entries: [string, ReturnType<typeof spawned>][] = [
+    ['old', spawned(10 * 60_000)],
+    ['fresh', spawned(5_000)]
+  ]
+
+  assert.deepEqual(selectPoolEvictions(entries, 1, NOW, FRESH_MS), ['old'])
+  assert.deepEqual(selectPoolEvictions(entries, 1, NOW, FRESH_MS, {}), ['old'])
+  assert.deepEqual(selectPoolEvictions(entries, 1, NOW, FRESH_MS, { mode: 'soft' }), ['old'])
+})
