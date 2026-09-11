@@ -28,6 +28,7 @@ import { api } from "@/lib/api";
 import type { ActiveProfileInfo, ProfileInfo } from "@/lib/api";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
@@ -320,13 +321,14 @@ export default function ProfilesPage() {
   const [noSkills, setNoSkills] = useState(false);
   const [newDescription, setNewDescription] = useState("");
   const [creating, setCreating] = useState(false);
-  // Model picker (lazy-loaded the first time a picker is opened). modelChoice
-  // is a "slug\u0000model" key, or "" to inherit from clone/default.
-  const [modelChoices, setModelChoices] = useState<
-    { provider: string; model: string; label: string }[] | null
-  >(null);
-  const modelChoicesLoading = useRef(false);
-  const [modelChoice, setModelChoice] = useState("");
+  // (create modal only; edit uses the standalone ModelPickerDialog below)
+  // Create-time model selection, captured from the shared ModelPickerDialog
+  // (provider-first / model-second). null = inherit from clone / default.
+  const [createModelSel, setCreateModelSel] = useState<{
+    provider: string;
+    model: string;
+  } | null>(null);
+  const [createModelPickerOpen, setCreateModelPickerOpen] = useState(false);
   const closeCreateModal = useCallback(() => setCreateModalOpen(false), []);
   const createModalRef = useModalBehavior({
     open: createModalOpen,
@@ -358,40 +360,13 @@ export default function ProfilesPage() {
   const descSavingCount = useRef(0);
   const describingCount = useRef(0);
 
-  // Inline model editor state
+  // Which profile's main model is being edited (opens the standalone
+  // ModelPickerDialog). Distinct from the globally-active management profile:
+  // editing a card always targets THAT card's profile explicitly.
   const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
-  const [modelEditChoice, setModelEditChoice] = useState("");
-  const [modelSaving, setModelSaving] = useState(false);
 
   // Per-profile "set active" in-flight name
   const [settingActive, setSettingActive] = useState<string | null>(null);
-
-  const modelKey = (provider: string | null, model: string | null) =>
-    provider && model ? `${provider}\u0000${model}` : "";
-
-  const loadModelChoices = useCallback(() => {
-    if (modelChoices !== null || modelChoicesLoading.current) return;
-    modelChoicesLoading.current = true;
-    api
-      .getModelOptions()
-      .then((res) => {
-        const flat: { provider: string; model: string; label: string }[] = [];
-        for (const prov of res.providers ?? []) {
-          for (const m of prov.models ?? []) {
-            flat.push({
-              provider: prov.slug,
-              model: m,
-              label: `${prov.name} · ${m}`,
-            });
-          }
-        }
-        setModelChoices(flat);
-      })
-      .catch(() => setModelChoices([]))
-      .finally(() => {
-        modelChoicesLoading.current = false;
-      });
-  }, [modelChoices]);
 
   const load = useCallback(() => {
     Promise.all([api.getProfiles(), api.getActiveProfile().catch(() => null)])
@@ -406,11 +381,6 @@ export default function ProfilesPage() {
   useEffect(() => {
     load();
   }, [load]);
-
-  // Lazily load the model picker the first time the create modal opens.
-  useEffect(() => {
-    if (createModalOpen) loadModelChoices();
-  }, [createModalOpen, loadModelChoices]);
 
   const isActive = useCallback(
     (p: ProfileInfo) =>
@@ -433,22 +403,17 @@ export default function ProfilesPage() {
     setCreating(true);
     try {
       const cloning = cloneFrom !== null;
-      const picked = modelChoice
-        ? modelChoices?.find(
-            (c) => `${c.provider}\u0000${c.model}` === modelChoice,
-          )
-        : undefined;
       const res = await api.createProfile({
         name,
         clone_from: cloneFrom,
         clone_all: cloning && cloneAll,
         no_skills: cloning ? false : noSkills,
         description: newDescription.trim() || undefined,
-        provider: picked?.provider,
-        model: picked?.model,
+        provider: createModelSel?.provider,
+        model: createModelSel?.model,
       });
       showToast(`${t.profiles.created}: ${name}`, "success");
-      if (picked && res.model_set === false) {
+      if (createModelSel && res.model_set === false) {
         showToast(
           `Profile created, but the model could not be saved — set it from the profile editor.`,
           "error",
@@ -459,7 +424,7 @@ export default function ProfilesPage() {
       setNoSkills(false);
       setCloneAll(false);
       setCloneFrom("default");
-      setModelChoice("");
+      setCreateModelSel(null);
       setCreateModalOpen(false);
       load();
     } catch (e) {
@@ -647,55 +612,22 @@ export default function ProfilesPage() {
 
   const openModelEditor = useCallback(
     (p: ProfileInfo) => {
-      if (editingModelFor === p.name) {
-        closeEditor();
-        return;
-      }
       setEditingSoulFor(null);
       setEditingDescFor(null);
-      setEditingModelFor(p.name);
-      setModelEditChoice(modelKey(p.provider, p.model));
-      loadModelChoices();
+      // Toggle: re-selecting the action for the open picker closes it.
+      setEditingModelFor((cur) => (cur === p.name ? null : p.name));
     },
-    [closeEditor, editingModelFor, loadModelChoices],
+    [],
   );
 
-  const handleSaveModel = async (name: string) => {
-    const picked = modelEditChoice
-      ? modelChoices?.find(
-          (c) => `${c.provider}\u0000${c.model}` === modelEditChoice,
-        )
-      : undefined;
-    if (!picked) return;
-    setModelSaving(true);
-    try {
-      await api.setProfileModel(name, picked.provider, picked.model);
-      showToast(`${L.modelSaved}: ${picked.model}`, "success");
-      setProfiles((prev) =>
-        prev.map((p) =>
-          p.name === name
-            ? { ...p, model: picked.model, provider: picked.provider }
-            : p,
-        ),
-      );
-      setEditingModelFor(null);
-    } catch (e) {
-      showToast(`${t.status.error}: ${e}`, "error");
-    } finally {
-      setModelSaving(false);
-    }
-  };
-
-  // Exactly one editor is open at a time; derive which profile + kind so a
-  // single dialog can render the right body.
-  const editorName = editingModelFor ?? editingDescFor ?? editingSoulFor;
-  const editorKind: "model" | "desc" | "soul" | null = editingModelFor
-    ? "model"
-    : editingDescFor
-      ? "desc"
-      : editingSoulFor
-        ? "soul"
-        : null;
+  // Description / SOUL share one modal; the model picker is a standalone
+  // ModelPickerDialog rendered separately (see below).
+  const editorName = editingDescFor ?? editingSoulFor;
+  const editorKind: "desc" | "soul" | null = editingDescFor
+    ? "desc"
+    : editingSoulFor
+      ? "soul"
+      : null;
   const editorModalRef = useModalBehavior({
     open: editorName != null,
     onClose: closeEditor,
@@ -896,30 +828,25 @@ export default function ProfilesPage() {
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="profile-model">{L.modelOptional}</Label>
-
-                <Select
-                  id="profile-model"
-                  value={modelChoice}
-                  disabled={modelChoices === null}
-                  onValueChange={setModelChoice}
+                <Label>{L.modelOptional}</Label>
+                <Button
+                  type="button"
+                  outlined
+                  className="justify-start font-mono text-xs"
+                  onClick={() => setCreateModelPickerOpen(true)}
                 >
-                  <SelectOption value="">
-                    {modelChoices === null ? L.modelLoading : L.modelInherit}
-                  </SelectOption>
-
-                  {(modelChoices ?? []).map((c) => (
-                    <SelectOption
-                      key={`${c.provider}\u0000${c.model}`}
-                      value={`${c.provider}\u0000${c.model}`}
-                    >
-                      {c.label}
-                    </SelectOption>
-                  ))}
-                </Select>
-
-                {modelChoices !== null && modelChoices.length === 0 && (
-                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
+                  {createModelSel
+                    ? `${createModelSel.provider} · ${createModelSel.model}`
+                    : L.modelInherit}
+                </Button>
+                {createModelSel && (
+                  <button
+                    type="button"
+                    className="justify-self-start text-xs text-muted-foreground underline"
+                    onClick={() => setCreateModelSel(null)}
+                  >
+                    {L.modelInherit}
+                  </button>
                 )}
               </div>
 
@@ -1258,11 +1185,7 @@ export default function ProfilesPage() {
                 id="profile-editor-title"
                 className="font-mondwest text-display text-base tracking-wider"
               >
-                {editorKind === "model"
-                  ? L.editModel
-                  : editorKind === "desc"
-                    ? L.description
-                    : t.profiles.soulSection}
+                {editorKind === "desc" ? L.description : t.profiles.soulSection}
                 <span className="text-muted-foreground"> · {editorName}</span>
               </h2>
             </header>
@@ -1273,49 +1196,6 @@ export default function ProfilesPage() {
                 editorKind === "soul" && "min-h-0 overflow-y-auto",
               )}
             >
-              {editorKind === "model" &&
-                (modelChoices !== null && modelChoices.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
-                ) : (
-                  <>
-                    <Select
-                      value={modelEditChoice}
-                      disabled={modelChoices === null}
-                      placeholder={
-                        modelChoices === null ? L.modelLoading : L.modelSelect
-                      }
-                      onValueChange={setModelEditChoice}
-                    >
-                      {(modelChoices ?? []).map((c) => (
-                        <SelectOption
-                          key={`${c.provider}\u0000${c.model}`}
-                          value={`${c.provider}\u0000${c.model}`}
-                        >
-                          {c.label}
-                        </SelectOption>
-                      ))}
-                    </Select>
-
-                    <div className="flex justify-end">
-                      <Button
-                        size="sm"
-                        className="uppercase"
-                        onClick={() => handleSaveModel(editorName)}
-                        disabled={
-                          modelSaving ||
-                          !modelChoices?.some(
-                            (c) =>
-                              `${c.provider}\u0000${c.model}` ===
-                              modelEditChoice,
-                          )
-                        }
-                      >
-                        {modelSaving ? t.common.saving : t.common.save}
-                      </Button>
-                    </div>
-                  </>
-                ))}
-
               {editorKind === "desc" && (
                 <>
                   <div className="flex items-center justify-between gap-2">
@@ -1391,6 +1271,70 @@ export default function ProfilesPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/*
+       * Per-profile main-model picker — the SAME component the default Models
+       * page uses. Every provider/model/refresh call is scoped to the profile
+       * whose card was clicked (editingModelFor), NOT the globally-active
+       * management profile. Saves through the rich POST /api/model/set?profile=.
+       */}
+      {editingModelFor && (
+        <ModelPickerDialog
+          key={`profile-model-picker-${editingModelFor}`}
+          title={`${L.editModel} · ${editingModelFor}`}
+          alwaysGlobal
+          loader={(opts) =>
+            api.getModelOptions({
+              profile: editingModelFor,
+              refresh: opts?.refresh,
+            })
+          }
+          onApply={async ({ provider, model, confirmExpensiveModel }) => {
+            const result = await api.setModelAssignment(
+              {
+                scope: "main",
+                provider,
+                model,
+                confirm_expensive_model: confirmExpensiveModel,
+              },
+              editingModelFor,
+            );
+            if (!result.confirm_required) {
+              setProfiles((prev) =>
+                prev.map((p) =>
+                  p.name === editingModelFor ? { ...p, provider, model } : p,
+                ),
+              );
+              showToast(`${L.modelSaved}: ${model}`, "success");
+            }
+            return result;
+          }}
+          onClose={() => setEditingModelFor(null)}
+        />
+      )}
+
+      {/*
+       * New-profile model selection reuses the same picker; the profile does
+       * not exist yet, so onApply only captures the structured choice into
+       * builder state and the subsequent POST /api/profiles carries it.
+       */}
+      {createModelPickerOpen && (
+        <ModelPickerDialog
+          key={`create-model-picker-${cloneFrom ?? "none"}`}
+          title={L.modelSelect}
+          alwaysGlobal
+          loader={(opts) =>
+            api.getModelOptions({
+              profile: cloneFrom || undefined,
+              refresh: opts?.refresh,
+            })
+          }
+          onApply={({ provider, model }) => {
+            setCreateModelSel({ provider, model });
+          }}
+          onClose={() => setCreateModelPickerOpen(false)}
+        />
       )}
     </div>
   );

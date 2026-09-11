@@ -1476,3 +1476,186 @@ describe('shared-remote hydration gate (#89843)', () => {
     expect($hydrationSyncProfile.get()).toBe('zephyr')
   })
 })
+
+// ── Shared root cause: a background refresh must not read as "a newer
+//    selection" ───────────────────────────────────────────────────────────────
+// openSessionGeneration is one process-global counter and EVERY host.openSession
+// bumped it, so the 5s roster poll re-pulling the open chat's transcript (or a
+// session.reclaimed mass-reap re-resume) cancelled a bot click still hydrating
+// with "Session open was superseded by a newer selection." — the reported
+// BotChat failure. intentSource:'background' snapshots the generation instead of
+// advancing it: it still fails closed on a target it no longer owns and is
+// itself superseded by a real user open, but it can never cancel one.
+describe('background opens never supersede a user selection', () => {
+  it('a background transcript refresh does not cancel a user open still hydrating (#sidebar-refresh)', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    const userOpen = host
+      .openSession('bot-a-chat', {
+        profile: 'aria',
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 1_000
+      })
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+
+    // The roster poll fires mid-wake and re-pulls the SAME chat in place.
+    await host.openSession('bot-a-chat', {
+      profile: 'aria',
+      intentSource: 'background'
+    })
+
+    // The user's wake now completes normally — it was never superseded.
+    setMockAtom($selectedStoredSessionId, 'bot-a-chat')
+    setMockAtom($activeSessionId, 'runtime-a')
+    setMockAtom($messages, [{ id: 'history-a', parts: [], role: 'assistant' }] as never)
+
+    expect(await userOpen).toBe('resolved')
+  })
+
+  it('a background open never raises the "Waking up …" overlay or the stranded-session Retry surface', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    // A poll-driven refresh of a chat whose surface is not yet healthy: it
+    // still hydrates+times out on its own budget, but a background refresh
+    // must NEVER paint the full-screen "Waking up …" swap overlay or arm the
+    // "Couldn't load this session / Retry" surface — the chat on screen is
+    // fine, only the background re-pull was slow.
+    const bg = host
+      .openSession('quiet-refresh', {
+        profile: 'aria',
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 20,
+        intentSource: 'background'
+      })
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+    expect($gatewaySwapTarget.get()).toBeNull()
+
+    expect(await bg).toMatch(/timed out loading/i)
+    expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+    expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
+  it('a background open still bails the instant a real user open supersedes it (stale response rejected)', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    const background = host
+      .openSession('reclaimed-chat', {
+        profile: 'ghost',
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 1_000,
+        intentSource: 'background'
+      })
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+
+    // A real click lands while the reclaim re-resume is still hydrating.
+    const userOpen = host.openSession('clicked-chat', {
+      profile: 'live',
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 1_000
+    })
+
+    setMockAtom($selectedStoredSessionId, 'clicked-chat')
+    setMockAtom($activeSessionId, 'runtime-clicked')
+    setMockAtom($messages, [{ id: 'history-clicked', parts: [], role: 'assistant' }] as never)
+
+    await userOpen
+    expect(await background).toMatch(/superseded/i)
+    // The background loser never dragged selection onto its own target.
+    expect($selectedStoredSessionId.get()).toBe('clicked-chat')
+  })
+
+  it('rapid user A → B → C ends with C open, A and B superseded', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    const a = host
+      .openSession('chat-a', { profile: 'p-a', awaitHydration: true, expectHistory: true, hydrationTimeoutMs: 1_000 })
+      .then(
+        () => 'a-resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+
+    const b = host
+      .openSession('chat-b', { profile: 'p-b', awaitHydration: true, expectHistory: true, hydrationTimeoutMs: 1_000 })
+      .then(
+        () => 'b-resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+
+    const c = host.openSession('chat-c', {
+      profile: 'p-c',
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 1_000
+    })
+
+    setMockAtom($selectedStoredSessionId, 'chat-c')
+    setMockAtom($activeSessionId, 'runtime-c')
+    setMockAtom($messages, [{ id: 'history-c', parts: [], role: 'assistant' }] as never)
+
+    await c
+    expect(await a).toMatch(/superseded/i)
+    expect(await b).toMatch(/superseded/i)
+    expect($selectedStoredSessionId.get()).toBe('chat-c')
+  })
+
+  it('repeated background refreshes of the same target never throw and never advance the selection', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    setMockAtom($selectedStoredSessionId, 'steady-chat')
+    setMockAtom($activeSessionId, 'runtime-steady')
+    setMockAtom($messages, [{ id: 'history-steady', parts: [], role: 'assistant' }] as never)
+
+    await host.openSession('steady-chat', { profile: 'steady', intentSource: 'background' })
+    await host.openSession('steady-chat', { profile: 'steady', intentSource: 'background' })
+
+    // A user open started right after is NOT superseded — the two background
+    // refreshes left the generation untouched.
+    const userOpen = host
+      .openSession('steady-chat', {
+        profile: 'steady',
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 1_000
+      })
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
+
+    setMockAtom($messages, [{ id: 'history-steady-2', parts: [], role: 'assistant' }] as never)
+    expect(await userOpen).toBe('resolved')
+  })
+})
