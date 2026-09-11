@@ -328,3 +328,56 @@ describe('a superseded click completes registry-side but never navigates', () =>
     expect(hostMock.openSession).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('the forever-chat is single-flighted — no duplicate default/Hermes chat', () => {
+  it('two concurrent opens of the same untitled bot issue exactly one session.create', async () => {
+    let createCalls = 0
+
+    respondWith(method => {
+      if (method === 'session.create') {
+        createCalls += 1
+
+        return { session_id: 'rt-1', stored_session_id: 'stored-1' }
+      }
+
+      return {}
+    })
+
+    const { createCanonicalChat } = await loadModule()
+
+    // The reported "a second Hermes entry appears" — a second click landing in
+    // the window before the first create's row carries the canonical title.
+    // Both calls register/adopt the same module-level flight synchronously,
+    // so only one session.create is ever issued.
+    const first = createCanonicalChat('ops')
+    const second = createCanonicalChat('ops')
+
+    expect(await first).toBe('stored-1')
+    expect(await second).toBe('stored-1')
+    expect(createCalls).toBe(1)
+  })
+
+  it('a background refresh that falls through to create still mints only one row', async () => {
+    let createCalls = 0
+
+    respondWith(method => {
+      if (method === 'session.create') {
+        createCalls += 1
+
+        return { session_id: 'rt-2', stored_session_id: 'stored-2' }
+      }
+
+      // session.list (registry lookup) — no existing "Bot Chat" row yet.
+      return {}
+    })
+
+    const { openBotCanonicalChat } = await loadModule()
+
+    await Promise.all([
+      openBotCanonicalChat('ops', null, { intentSource: 'background' }),
+      openBotCanonicalChat('ops', null, { intentSource: 'background' })
+    ])
+
+    expect(createCalls).toBe(1)
+  })
+})

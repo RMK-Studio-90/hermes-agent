@@ -85,7 +85,12 @@ describe('a row click lands on the canonical chat, never a remembered side tab',
 
     await expect(openRosterBot(canonicalBot)).resolves.toBe(true)
 
-    expect(openBotCanonicalChat).toHaveBeenCalledWith(canonicalBot, expect.any(Function))
+    // The in-place refresh is 'background' — it re-pulls the transcript
+    // without bumping the user-selection generation, so it can never cancel a
+    // concurrent bot click with "superseded".
+    expect(openBotCanonicalChat).toHaveBeenCalledWith(canonicalBot, expect.any(Function), {
+      intentSource: 'background'
+    })
     $selectedStoredSessionId.set(null)
   })
 
