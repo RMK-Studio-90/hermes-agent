@@ -1,4 +1,14 @@
 .DS_Store
+
+# RMK: nested worktrees created under .claude are their own git checkouts;
+# keep them out of the main tree's status (see backup manifest 2026-09-11).
+/.claude/worktrees/
+
+# RMK: out-of-domain content that landed in this checkout by accident —
+# preserved on disk (and in the 2026-09-11 backup) but excluded from git.
+/Claude outputs/
+/flyer_builder/
+
 /venv/
 /venv.old/
 /venv.stale.runtime-*/
