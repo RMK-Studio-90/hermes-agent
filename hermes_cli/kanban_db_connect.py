@@ -24,6 +24,21 @@ from typing import Any
 from typing import Optional
 
 
+# BUILD-01 supply-helper (fail-closed, no circular import): reads the
+# on-disk ``_config_version`` from hermes_cli.config; returns "unknown" when
+# unavailable so legacy-backfill rows do NOT get a fabricated numeric 0.
+def _b01_config_version() -> str:
+    try:
+        from hermes_cli.config import check_config_version
+    except Exception:  # pragma: no cover - defensive only
+        return "unknown"
+    try:
+        current, _latest = check_config_version()
+        return str(current) if current is not None else "unknown"
+    except Exception:
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
@@ -891,6 +906,169 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if _table_exists(conn, "task_runs"):
         _backfill_legacy_inflight_runs(conn)
 
+    # -------------------------------------------------------------------
+    # BUILD-01 (Telemetry / Correlation Foundations) additive migration
+    # -------------------------------------------------------------------
+    # Per K05/K09: the K05 ``execution_id`` field is logically mapped to the
+    # existing INTEGER ``task_runs.id`` (no separate TEXT column, no second ID
+    # spine — task_runs.id is the canonical run/execution spine). K05
+    # ``config_version`` and K05 ``latency_ms`` live as additive, nullable
+    # task_runs columns so the envelope fields are indexable via plain SQL.
+    # K05 ``schema_version`` and K05 ``cost_state`` live in the existing
+    # ``task_runs.metadata`` JSON payload — written by the instrumentation
+    # helpers above (BUILD-01 paths only).
+    # ``task_runs`` is optional in partially-provisioned/legacy databases (the
+    # upstream backfill above guards on it for the same reason), so every
+    # BUILD-01 statement below must be table-guarded: an unguarded ALTER/CREATE
+    # INDEX here aborts the whole migration on such a DB.
+    if _table_exists(conn, "task_runs"):
+        cols = _column_names(conn, "task_runs")
+        if "latency_ms" not in cols:
+            _add_column_if_missing(conn, "task_runs", "latency_ms", "latency_ms INTEGER")
+        if "config_version" not in cols:
+            _add_column_if_missing(conn, "task_runs", "config_version", "config_version TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_config_version ON task_runs(config_version)"
+        )
+
+    # ---------------------------------------------------------------------
+    # BUILD-02 (Evaluation Events + Reflection Records) additive migration
+    # ---------------------------------------------------------------------
+    # Per K09 §6.2: evaluation_events (K05 D-04) and reflection_records
+    # (K05 D-05) tables. Both are additive; no changes to existing tables.
+    # SCHEMA_SQL already contains the CREATE statements for a fresh board;
+    # this block ensures a legacy board without them gets them added
+    # idempotently.
+    conn.execute("""CREATE TABLE IF NOT EXISTS evaluation_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'evaluation_event'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    status                TEXT    NOT NULL CHECK (status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    eval_run_id           TEXT    NOT NULL,
+    suite                 TEXT    NOT NULL,
+    case_ref              TEXT    NOT NULL,
+    criterion_ref         TEXT    NOT NULL,
+    verdict               TEXT    NOT NULL CHECK (verdict IN (
+        'pass','fail','inconclusive','blocked')),
+    subject_model         TEXT    NOT NULL,
+    subject_provider      TEXT    NOT NULL,
+    run_id                INTEGER NOT NULL,
+    score                 REAL,
+    judge                 TEXT,
+    tokens_input          INTEGER,
+    tokens_output         INTEGER,
+    data_latency_ms       INTEGER,
+    subject_prompt_version TEXT,
+    subject_config_version INTEGER,
+    hard_fail_classes     TEXT,
+    data_evidence_refs    TEXT,
+    execution_id          TEXT,
+    task_id               TEXT,
+    session_id            TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,
+    data_error_json       TEXT,
+    created_at            INTEGER NOT NULL,
+    UNIQUE (suite, eval_run_id)
+)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_run "
+        "ON evaluation_events(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_case "
+        "ON evaluation_events(suite, case_ref)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_events_ts "
+        "ON evaluation_events(timestamp)"
+    )
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS reflection_records (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'reflection_record'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    event_status          TEXT    NOT NULL CHECK (event_status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    scope                 TEXT    NOT NULL CHECK (scope IN (
+        'memory','skill','invariant','process','security')),
+    finding               TEXT    NOT NULL,
+    reflection_status     TEXT    NOT NULL CHECK (reflection_status IN (
+        'captured','triaged','resolved','actioned','dismissed')),
+    run_id                INTEGER,
+    task_id               TEXT,
+    session_id            TEXT,
+    execution_id          TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,
+    turn_ref              TEXT,
+    suggested_action      TEXT,
+    severity              TEXT    CHECK (severity IS NULL OR
+        severity IN ('info','low','medium','high','critical')),
+    data_session_id       TEXT,
+    data_evidence_refs    TEXT,
+    data_source_event_ids TEXT,
+    data_error_json       TEXT,
+    created_at            INTEGER NOT NULL
+)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refl_run "
+        "ON reflection_records(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refl_ts "
+        "ON reflection_records(timestamp)"
+    )
+
+    # BUILD-07 (Security / Protected-Component Audit Sink): additive tables
+    # SecurityEvent (K05 §7 + §9 hash chain) + pattern_store/proposal_store
+    # (K05 D-06/D-07, schemas only). Lazy import avoids a cycle; the migration
+    # is idempotent.
+    try:
+        from hermes_cli.audit_sink import build07_migration  # noqa: E402
+        build07_migration(conn)
+    except ImportError:
+        # audit_sink is an RMK overlay module; its absence must not break the
+        # upstream migration (defensive, matches overlay-additive design).
+        pass
+
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.
     for old, new in (
@@ -925,14 +1103,15 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
                     task_id, profile, status,
                     claim_lock, claim_expires, worker_pid,
                     max_runtime_seconds, last_heartbeat_at,
-                    started_at
-                ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    started_at, config_version
+                ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"], row["assignee"], row["claim_lock"],
                     row["claim_expires"], row["worker_pid"],
                     row["max_runtime_seconds"], row["last_heartbeat_at"],
                     started,
+                    _b01_config_version(),
                 ),
             )
             # CAS: only install the pointer if nothing claimed the task
