@@ -614,29 +614,78 @@ async def get_session_messages(
         )
 
     def _read():
-        db = _open_session_db_for_profile(profile, read_only=True)
-        try:
-            sid = db.resolve_session_id(session_id)
-            if not sid:
-                return None
-            sid = db.resolve_resume_session_id(sid)
-            # Always page this endpoint. An omitted limit used to load an
-            # entire transcript, which can be hundreds of thousands of rows
-            # for a runaway session and exhaust the dashboard process. Keep
-            # explicit pagination anchored at the start, while the default
-            # dashboard view returns the latest page in chronological order.
-            default_page = limit is None
-            latest_page = order == "latest" or (order is None and default_page)
-            _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
-                sid,
-                limit=_limit,
-                offset=offset,
-                latest=latest_page,
-                include_compacted=include_compacted,
+        # Desktop Bot Mode can omit the owning profile when opening a
+        # canonical Bot Chat. Try the requested/default profile first.
+        # If no explicit profile was supplied and the session is not there,
+        # fall back to the local bot profiles under HERMES_HOME/profiles.
+        candidate_profiles = [profile]
+
+        if not profile:
+            from pathlib import Path
+            import os
+
+            hermes_home = Path(
+                os.environ.get(
+                    "HERMES_HOME",
+                    str(Path.home() / ".hermes"),
+                )
             )
-        finally:
-            db.close()
+            profiles_dir = hermes_home / "profiles"
+
+            if profiles_dir.is_dir():
+                candidate_profiles.extend(
+                    p.name
+                    for p in profiles_dir.iterdir()
+                    if p.is_dir()
+                )
+
+        seen_profiles = set()
+
+        for candidate_profile in candidate_profiles:
+            profile_key = candidate_profile or "__default__"
+
+            if profile_key in seen_profiles:
+                continue
+
+            seen_profiles.add(profile_key)
+
+            try:
+                db = _open_session_db_for_profile(
+                    candidate_profile,
+                    read_only=True,
+                )
+            except Exception:
+                continue
+
+            try:
+                sid = db.resolve_session_id(session_id)
+
+                if not sid:
+                    continue
+
+                sid = db.resolve_resume_session_id(sid)
+
+                # Always page this endpoint. An omitted limit used to load an
+                # entire transcript, which can be hundreds of thousands of rows
+                # for a runaway session and exhaust the dashboard process.
+                default_page = limit is None
+                latest_page = (
+                    order == "latest"
+                    or (order is None and default_page)
+                )
+                _limit = 500 if default_page else min(limit, 500)
+
+                return sid, _limit, db.get_messages(
+                    sid,
+                    limit=_limit,
+                    offset=offset,
+                    latest=latest_page,
+                    include_compacted=include_compacted,
+                )
+            finally:
+                db.close()
+
+        return None
 
     result = await asyncio.to_thread(_read)
     if result is None:
