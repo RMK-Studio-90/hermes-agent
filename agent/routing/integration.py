@@ -81,11 +81,16 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
         has_images=has_images, force_tools=bool(getattr(agent, "tools", [])),
     )
     agent._routing_required = required
-    primary = (agent.provider, agent.model)
+    concrete = str(getattr(agent, "model", "") or "").strip()
+    primary = (agent.provider, concrete) if concrete else None
     # Existing conversations retain their provider/prompt prefix. Explicit model
     # switches already use the canonical switch_model API and remain authoritative.
-    pinned = (getattr(agent, "_routing_explicit_model", True)
-              or bool(conversation_history) or bool(getattr(agent, "_cached_system_prompt", None)))
+    # An EMPTY model ("") is the automatic-routing sentinel, never a user pin: it
+    # must not narrow the candidate pool to an unresolvable (provider, "") route
+    # that yields NO_ELIGIBLE_MODEL before a physical model is chosen (routing #3).
+    pinned = bool(concrete) and (getattr(agent, "_routing_explicit_model", True)
+                                 or bool(conversation_history)
+                                 or bool(getattr(agent, "_cached_system_prompt", None)))
     from agent.routing.runtime import configured_router
     runtime = configured_router(config)
     if runtime is not None:

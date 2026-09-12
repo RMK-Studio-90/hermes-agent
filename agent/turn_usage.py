@@ -76,6 +76,18 @@ def record_response_usage(
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
     agent.session_api_calls += 1
+    from agent.routing.integration import is_enabled, note_outcome
+    if is_enabled():
+        req = getattr(agent, "_routing_required", None)
+        route_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode) if getattr(response, "usage", None) else None
+        note_outcome(agent.provider, agent.model, True,
+                     registry=getattr(getattr(agent, "_routing_runtime", None), "registry", None),
+                     history=getattr(getattr(agent, "_routing_runtime", None), "history", None),
+                     cap_class=req.cap_class() if req else "",
+                     latency_ms=api_duration * 1000, session_id=agent.session_id,
+                     token_usage={"input_tokens": route_usage.input_tokens,
+                                  "output_tokens": route_usage.output_tokens} if route_usage else None)
+        agent._routing_failure_recorded = None
     if not (hasattr(response, 'usage') and response.usage):
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the

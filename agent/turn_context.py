@@ -892,6 +892,8 @@ def build_turn_context(
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
     agent._restore_primary_runtime()
+    from agent.routing.integration import prepare_turn_route
+    prepare_turn_route(agent, user_message, conversation_history)
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
 

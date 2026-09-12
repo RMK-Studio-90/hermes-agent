@@ -132,6 +132,15 @@ def handle_api_error(
     if _recovered:
         return _verdict("continue")
 
+    from agent.routing.integration import note_outcome
+    req = getattr(agent, "_routing_required", None)
+    note_outcome(agent.provider, agent.model, False, reason=classified,
+                 registry=getattr(getattr(agent, "_routing_runtime", None), "registry", None),
+                 history=getattr(getattr(agent, "_routing_runtime", None), "history", None),
+                 cap_class=req.cap_class() if req else "", session_id=agent.session_id,
+                 latency_ms=(time.time() - api_start_time) * 1000)
+    agent._routing_failure_recorded = (agent.provider, agent.model)
+
     retry_count += 1
     elapsed_time = time.time() - api_start_time
     agent._touch_activity(f"API error recovery (attempt {retry_count}/{max_retries})")
