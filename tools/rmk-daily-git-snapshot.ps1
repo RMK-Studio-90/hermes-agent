@@ -86,6 +86,7 @@ $MutexName       = 'Global\RMK-Hermes-Daily-Git-Snapshot'
 $AllowlistExactPaths = @(
     '.gitignore'
     'docs/operations/DAILY_GIT_SNAPSHOT.md'
+    'docs/rmk/HERMES_DAILY_STATUS.md'
     'tools/rmk-daily-git-snapshot.ps1'
     'tools/install-rmk-daily-git-snapshot.ps1'
     '.github/workflows/rmk-daily-snapshot-health-check.yml'
@@ -149,7 +150,13 @@ function Invoke-GitExit0 {
 function Get-PorcelainEntries {
     # Returns an array of @{ Code = 'XY'; Path = 'a/b/c' } from
     # `git status --porcelain -z`, robust to spaces/special chars.
-    $statusZ = & git -C $RepoPath status --porcelain -z 2>&1
+    # --untracked-files=all: without it, git collapses a brand-new, entirely
+    # untracked directory (e.g. the first-ever run creating docs/rmk/) into
+    # one line for the directory itself, so an exact-path allowlist entry for
+    # the file inside it (docs/rmk/HERMES_DAILY_STATUS.md) never matches.
+    # Confirmed: this silently produced "nothing allowlisted to snapshot" on
+    # a clean first-run test before this fix.
+    $statusZ = & git -C $RepoPath status --porcelain --untracked-files=all -z 2>&1
     $raw = ($statusZ -join "`n")
     $parts = $raw -split "`0" | Where-Object { $_ -ne '' }
     $entries = @()
@@ -212,6 +219,30 @@ try {
         Write-Log "FATAL: $RepoPath is not a valid git repository. Detail: $isRepo"
         Write-Log "END (not a git repository)"
         exit 4
+    }
+
+    # -----------------------------------------------------------------
+    # 1a. Regenerate docs/rmk/HERMES_DAILY_STATUS.md (allowlisted, dynamic
+    #     daily-state artifact) before status is captured below, so a fresh
+    #     write is picked up by the same porcelain scan the rest of this run
+    #     evaluates. Best-effort only: this is content generation, not a
+    #     safety guard, so a failure here is logged and the run continues
+    #     with whatever the file already contained (or without it).
+    # -----------------------------------------------------------------
+    $statusGenScript = Join-Path $RepoPath 'tools\rmk-daily-status.ps1'
+    if (Test-Path -LiteralPath $statusGenScript) {
+        try {
+            $statusOut = & powershell -NoProfile -File $statusGenScript 2>&1
+            $statusExit = $LASTEXITCODE
+            foreach ($line in $statusOut) { Write-Log "  [status] $line" }
+            if ($statusExit -ne 0) {
+                Write-Log "WARN: status generation exited $statusExit - continuing with existing file state."
+            }
+        } catch {
+            Write-Log "WARN: status generation threw: $($_.Exception.Message) - continuing."
+        }
+    } else {
+        Write-Log "WARN: status generator not found at $statusGenScript - skipping."
     }
 
     # -----------------------------------------------------------------
