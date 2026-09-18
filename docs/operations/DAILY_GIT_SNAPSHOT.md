@@ -169,3 +169,4 @@ exactly `rmk/integration-current-upstream`, the script logs `STOP:
 expected branch ... but found ...` and exits `2` **without switching
 branches, without resetting, without touching the working tree**.
 test change
+further test
