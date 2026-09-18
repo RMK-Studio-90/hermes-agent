@@ -292,15 +292,17 @@ class AdaptiveRouter:
         return self._auto(ctx)
 
     def _auto(self, ctx: RouteContext) -> Decision:
-        entries = self.registry.candidates(ctx.candidate_routes)
+        all_entries = self.registry.candidates(ctx.candidate_routes)
         billing_rejected = []
         if ctx.zero_paid:
             billing_rejected = [{"route": [e.provider, e.model_id],
                                  "reason": "BILLING_NOT_ZERO_COST"}
-                                for e in entries if not e.is_zero_cost]
-            entries = [entry for entry in entries if entry.is_zero_cost]
+                                for e in all_entries if not e.is_zero_cost]
+            entries = [entry for entry in all_entries if entry.is_zero_cost]
         elif not ctx.allow_paid:
-            entries = [entry for entry in entries if entry.is_free]
+            entries = [entry for entry in all_entries if entry.is_free]
+        else:
+            entries = all_entries
         rank = rank_candidates(
             entries, ctx.required, history=self.history,
             now=ctx.now, now_epoch=ctx.now_epoch, half_life_seconds=ctx.half_life_seconds,
@@ -314,6 +316,23 @@ class AdaptiveRouter:
         why["rejected"].extend(billing_rejected)
         if rank.best is None:
             why["error"] = "NO_ELIGIBLE_MODEL"
+            if billing_rejected:
+                # Zero-cost pool exhausted, but candidates were excluded solely
+                # by the billing gate. Never spend automatically -- but also
+                # never report NO_ELIGIBLE_MODEL when a paid/unknown-cost route
+                # would actually satisfy this task's capabilities; that is a
+                # distinct, human-actionable state (approve the spend), not a
+                # dead end. Re-rank the full pool with the billing gate lifted
+                # to check whether a capability-eligible paid candidate exists.
+                unrestricted = rank_candidates(
+                    all_entries, ctx.required, history=self.history,
+                    now=ctx.now, now_epoch=ctx.now_epoch,
+                    half_life_seconds=ctx.half_life_seconds,
+                    logical_route=ctx.logical_route,
+                )
+                if unrestricted.best is not None:
+                    why["error"] = "PAID_MODEL_APPROVAL_REQUIRED"
+                    why["paid_candidates"] = [list(c.route) for c in unrestricted.ranked]
             return Decision(provider=None, model=None, mode="auto", why=why,
                             exhausted=True, requires_paid=rank.requires_paid)
         best = rank.best

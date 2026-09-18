@@ -153,7 +153,8 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
         decision = ModelRouter().select_workload(
             agent, runtime, required, workload, pinned=pinned)
         if decision.route is None:
-            raise ValueError(f"NO_ELIGIBLE_MODEL: {decision.why}")
+            error_code = decision.why.get("error", "NO_ELIGIBLE_MODEL")
+            raise ValueError(f"{error_code}: {decision.why}")
         # Execution keeps Hermes' canonical provider lifecycle. Only the pool
         # and order come from Smart Routing; no gateway combo is introduced.
         existing = {(str(e.get("provider") or "").strip().lower(),
