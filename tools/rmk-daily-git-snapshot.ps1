@@ -220,7 +220,13 @@ try {
     $timestamp     = Get-Iso8601Now
     $currentBranch = (Invoke-GitExit0 @('rev-parse', '--abbrev-ref', 'HEAD')) | Select-Object -Last 1
     $previousHead  = (Invoke-GitExit0 @('rev-parse', 'HEAD')) | Select-Object -Last 1
-    $entries       = Get-PorcelainEntries
+    # @(...) forces a real array regardless of element count. Without it, a
+    # PowerShell 5.1 pipeline/return that yields exactly ONE PSCustomObject
+    # collapses to a bare scalar, which has no .Count property -- every
+    # ".Count -gt 0" guard below would then silently read $null (not 1) and
+    # fail to fire for the single-match case. Confirmed exploitable: a lone
+    # pre-staged unrelated file bypassed the step-5 guard before this fix.
+    $entries       = @(Get-PorcelainEntries)
 
     Write-Log "Timestamp: $timestamp"
     Write-Log "Branch (current): $currentBranch"
@@ -256,7 +262,7 @@ try {
     #    build our commit on top of a pre-dirty index - too ambiguous,
     #    could sweep unrelated staged work into our snapshot commit.
     # -----------------------------------------------------------------
-    $alreadyStaged = $entries | Where-Object { $_.Code[0] -ne ' ' -and $_.Code[0] -ne '?' }
+    $alreadyStaged = @($entries | Where-Object { $_.Code[0] -ne ' ' -and $_.Code[0] -ne '?' })
     if ($alreadyStaged.Count -gt 0) {
         Write-Log "SNAPSHOT_BLOCKED_UNRELATED_STAGED_CHANGES"
         Write-Log "The Git index already contains staged changes before this run started. Aborting without staging/committing anything."
@@ -272,7 +278,7 @@ try {
     #    never candidates for staging since they are not in the
     #    allowlist, but we log them explicitly per the safety mandate.
     # -----------------------------------------------------------------
-    $protectedDirty = $entries | Where-Object { Test-IsProtectedRoutingPath $_.Path }
+    $protectedDirty = @($entries | Where-Object { Test-IsProtectedRoutingPath $_.Path })
     if ($protectedDirty.Count -gt 0) {
         Write-Log "PROTECTED_ROUTING_FILES_DIRTY (reported only, NOT staged, NOT touched, NOT reset):"
         foreach ($e in $protectedDirty) { Write-Log "  $($e.Code) $($e.Path)" }
@@ -282,7 +288,7 @@ try {
     # 7. Determine allowlist candidates: entries whose path is an exact
     #    match in $AllowlistExactPaths and that are actually dirty.
     # -----------------------------------------------------------------
-    $candidates = $entries | Where-Object { $AllowlistExactPaths -contains $_.Path }
+    $candidates = @($entries | Where-Object { $AllowlistExactPaths -contains $_.Path })
 
     if ($candidates.Count -eq 0) {
         Write-Log "No allowlisted path changed (other dirty files exist but are outside the allowlist and are correctly left untouched)."
@@ -324,8 +330,8 @@ try {
     # 9. Gitlink / embedded-repository guard. Never commit through an
     #    unexpected mode 160000 entry in the index.
     # -----------------------------------------------------------------
-    $lsFiles = & git -C $RepoPath ls-files -s 2>&1
-    $gitlinks = $lsFiles | Where-Object { $_ -match '^160000\s' }
+    $lsFiles = @(& git -C $RepoPath ls-files -s 2>&1)
+    $gitlinks = @($lsFiles | Where-Object { $_ -match '^160000\s' })
     if ($gitlinks.Count -gt 0) {
         Write-Log "SNAPSHOT_BLOCKED_GITLINK_DETECTED"
         Write-Log "Unexpected embedded-repository (mode 160000) entries found in the index. Aborting without staging/committing. Physical files are left untouched."
@@ -346,8 +352,8 @@ try {
     # 11. Defense-in-depth: verify every staged path is in the
     #     allowlist. Abort (do not commit, do not auto-unstage) if not.
     # -----------------------------------------------------------------
-    $stagedPaths = & git -C $RepoPath diff --cached --name-only 2>&1
-    $notAllowed = $stagedPaths | Where-Object { $AllowlistExactPaths -notcontains $_ }
+    $stagedPaths = @(& git -C $RepoPath diff --cached --name-only 2>&1)
+    $notAllowed = @($stagedPaths | Where-Object { $AllowlistExactPaths -notcontains $_ })
     if ($notAllowed.Count -gt 0) {
         Write-Log "SNAPSHOT_BLOCKED_STAGED_PATH_NOT_ALLOWLISTED"
         Write-Log "A staged path outside the allowlist was detected after staging. Aborting without committing. Not auto-unstaging (manual review required)."
