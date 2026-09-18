@@ -87,9 +87,10 @@ from hermes_cli.update_cmd_deps import (  # noqa: F401
     _venv_core_imports_healthy, _venv_foreign_owned_paths, _web_build_toolchain_ready,
     _web_toolchain_roots)
 from hermes_cli.update_cmd_git import (  # noqa: F401
-    OFFICIAL_REPO_URL, OFFICIAL_REPO_URLS, SKIP_UPSTREAM_PROMPT_FILE, _ORPHAN_RESCUE_REFS_TO_KEEP,
-    _ORPHAN_RESCUE_REF_MAX_AGE_DAYS, _add_upstream_remote, _assess_parked_branch_switch,
-    _branch_head_label, _branch_head_suffix, _classify_fetch_failure, _count_commits_between,
+    OFFICIAL_REPO_URL, OFFICIAL_REPO_URLS, SKIP_UPSTREAM_PROMPT_FILE, _BAR,
+    _ORPHAN_RESCUE_REFS_TO_KEEP, _ORPHAN_RESCUE_REF_MAX_AGE_DAYS, _add_upstream_remote,
+    _assess_parked_branch_switch, _branch_head_label, _branch_head_suffix,
+    _classify_fetch_failure, _count_commits_between,
     _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _portable_git_candidates, _print_fetch_failure,
@@ -123,6 +124,14 @@ def _updates_config() -> dict:
     from hermes_cli.config import load_config
     section = (load_config() or {}).get("updates", {})
     return section if isinstance(section, dict) else {}
+
+
+def _resume_windows_gateways_safely(_windows_gateway_resume):
+    """Best-effort gateway resume after abort paths. Never raises."""
+    try:
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+    except Exception as exc:
+        print(f"⚠ Gateway resume failed (non-fatal): {exc}")
 
 
 def _no_prompt_git_kwargs() -> dict:
@@ -705,9 +714,95 @@ def _repair_current_checkout(
     return current_checkout_complete
 
 
-def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
+def _capture_worktree_state(git_cmd, cwd) -> dict:
+    """Exact pre-update working state for the merge-conflict transaction: branch, HEAD, the
+    full ``status --porcelain`` (staged + unstaged + untracked) and the untracked path list.
+    These are later compared against the post-abort tree to prove byte/state equivalence."""
+    return {
+        "branch": (_git_run(git_cmd, ["branch", "--show-current"]).stdout or "").strip(),
+        "head": (_git_run(git_cmd, ["rev-parse", "HEAD"]).stdout or "").strip(),
+        "porcelain": sorted(
+            (line for line in (_git_run(git_cmd, ["status", "--porcelain"]).stdout or "").splitlines()
+             if line.strip())),
+        "untracked": sorted(
+            (line for line in (_git_run(git_cmd, ["ls-files", "--others", "--exclude-standard"]).stdout or "").splitlines()
+             if line.strip())),
+    }
+
+
+def _restore_autostash_exact(git_cmd, cwd, stash_ref, pre_update_state) -> bool:
+    """Apply the auto-stash back EXACTLY (index + worktree + untracked) and verify the tree
+    matches the captured pre-update state. The stash is kept as recovery until verification
+    passes and only dropped afterwards. Returns True only when every check succeeds.
+
+    ``git stash apply --index`` restores the staged/unstaged split that plain ``apply`` flattens;
+    ``--include-untracked`` stashes restore their untracked files on apply. After ``merge --abort``
+    the tree is clean at the stash base, so an exact apply is possible and must be verified."""
+    from hermes_cli.update_cmd_stash import _drop_restored_stash
+    print("  → Restoring local changes exactly (auto-stash, incl. staged and untracked)...")
+    apply = _git_run(git_cmd, ["stash", "apply", "--index", stash_ref], cwd)
+    unmerged = _git_run(git_cmd, ["diff", "--name-only", "--diff-filter=U"], cwd).stdout.strip()
+    if apply.returncode != 0 or unmerged:
+        # --index apply failed (or left conflicts): the pre-update tree is gone, so landing the
+        # worktree portion alone is not EXACT. Keep the stash as the recovery copy and fail closed.
+        _print_nonempty(apply.stdout)
+        _print_nonempty(apply.stderr)
+        _git_run(git_cmd, ["reset", "--hard", "HEAD"], cwd)
+        print("  ✗ Could not restore your stashed changes exactly (staged state could not be reapplied).")
+        return False
+    # Verification: branch == pre-update, HEAD == pre-update, working+staged == pre-update,
+    # untracked == pre-update. Only claim restoration after every check actually passed.
+    now = _capture_worktree_state(git_cmd, cwd)
+    checks = {
+        "branch": now["branch"] == (pre_update_state or {}).get("branch"),
+        "HEAD": now["head"] == (pre_update_state or {}).get("head"),
+        "staged+worktree": now["porcelain"] == (pre_update_state or {}).get("porcelain", []),
+        "untracked": now["untracked"] == (pre_update_state or {}).get("untracked", []),
+    }
+    if all(checks.values()):
+        # Stash fully consumed — drop it now that restoration is verified.
+        _drop_restored_stash(git_cmd, cwd, stash_ref)
+        print("  ✓ Local changes restored exactly — branch, HEAD, staged, working tree and untracked files all match pre-update.")
+        return True
+    for name, ok in checks.items():
+        if not ok:
+            print(f"  ✗ Restore verification failed: {name} differs from the captured pre-update state.")
+    print(f"  Your changes are preserved in the stash — recover with: git stash apply {stash_ref}")
+    return False
+
+
+def _settle_merge_conflict(git_cmd, branch, cur_branch, auto_stash_ref, pre_update_state,
+                           _windows_gateway_resume) -> None:
+    """MERGE-CONFLICT TRANSACTION close-out: ``git merge --abort``, restore the auto-stash EXACTLY
+    and verify (branch / HEAD / staged / worktree / untracked == pre-update), keep the stash as
+    recovery until verification passes, resume gateways exactly once, and report honestly — never
+    claiming restoration that was not verified, never accepting, never "Update complete".
+
+    Does NOT leave the user's local work hidden in an auto-stash, and does NOT write the
+    ``.update-incomplete`` marker, so the Desktop shim classifies this run as non-retryable."""
+    print()
+    print(f"✗ Merge conflict between local commits and origin/{branch} — aborting the merge.")
+    abort = _git_run(git_cmd, ["merge", "--abort"])
+    if abort.returncode != 0:
+        _print_nonempty(abort.stdout)
+        _print_nonempty(abort.stderr)
+        print(f"  ⚠ git merge --abort returned {abort.returncode} — the checkout may still hold conflict state.")
+    if auto_stash_ref is not None:
+        _restore_autostash_exact(git_cmd, _m().PROJECT_ROOT, auto_stash_ref, pre_update_state)
+    else:
+        print("  (No local changes were stashed before the update attempt.)")
+    # Restore/resume gateways exactly once; never raises.
+    _resume_windows_gateways_safely(_windows_gateway_resume)
+
+
+def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, auto_stash_ref=None,
+                                 pre_update_state=None, _windows_gateway_resume=None) -> bool:
     """Fast-forward failed: merge on a custom branch (local commits survive) or reset --hard on the
-    same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure."""
+    same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure.
+
+    Returns True when a MERGE CONFLICT was settled — aborted, the auto-stash restored exactly and
+    verified, gateways resumed — so the caller must exit non-retryably and never accept the update.
+    Returns False in every other handled case (merge or reset succeeded)."""
     # A custom branch (local commits atop origin/<branch>) also can't ff, and reset --hard
     # would discard that work: merge instead, stop on conflict.
     _cur_branch = (_git_run(git_cmd, ["branch", "--show-current"]).stdout or "").strip()
@@ -718,12 +813,10 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         # Best-effort safety tag as a recovery anchor.
         _git_run(git_cmd, ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"])
         if _git_run(git_cmd, ["merge", "--no-edit", f"origin/{branch}"]).returncode != 0:
-            _git_run(git_cmd, ["merge", "--abort"])
-            print("✗ Merge conflict between local commits and upstream — update stopped, nothing was changed.")
-            print(f"  Resolve manually: cd {_m().PROJECT_ROOT} && git merge origin/{branch}")
-            print("  Then re-run the update. Local work is untouched.")
-            sys.exit(1)
-        return
+            _settle_merge_conflict(
+                git_cmd, branch, _cur_branch, auto_stash_ref, pre_update_state, _windows_gateway_resume)
+            return True
+        return False
     # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
     # local graph, so park pre_pull_sha behind a rescue ref first.
@@ -788,7 +881,7 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
 
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
-    keep_stash):
+    keep_stash, pre_update_state=None, _windows_gateway_resume=None):
     """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
     custom branch -> merge, same branch -> reset, orphan history -> rescue ref first; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
@@ -802,7 +895,17 @@ def _pull_updates(
         # merge --ff-only the already-fetched ref instead of `git pull`, which would do a
         # SECOND network fetch; identical in effect given the fresh tracking ref.
         if _git_run(git_cmd, ["merge", "--ff-only", f"origin/{branch}"]).returncode != 0:
-            _reconcile_diverged_checkout(git_cmd, branch, pre_pull_sha)
+            conflict_settled = _reconcile_diverged_checkout(
+                git_cmd, branch, pre_pull_sha, auto_stash_ref=auto_stash_ref,
+                pre_update_state=pre_update_state,
+                _windows_gateway_resume=_windows_gateway_resume)
+            if conflict_settled:
+                # The transaction already restored (or safely retained) the
+                # autostash and resumed the gateway.  Do not let the generic
+                # finally block handle the same stash a second time, and stop
+                # before dependency/build phases can accept a failed merge.
+                auto_stash_ref = None
+                sys.exit(1)
         _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha)
         update_succeeded = True
     finally:
@@ -835,6 +938,7 @@ class _CheckoutPlan:
     prompt_for_restore: bool
     switch_block_reason: "str | None"
     upstream_checked: bool
+    pre_update_state: "dict | None"
 
 
 def _apply_parked_branch_guard(
@@ -846,11 +950,59 @@ def _apply_parked_branch_guard(
     By branch contents + updates.parked_branch_strategy: fully merged -> switch back;
     unmerged -> "switch" (default; loud "kept" notice) or "update_in_place" (merge origin/<target>
     INTO the branch, checkout never moves; --switch-branch overrides once); dirty/unverifiable ->
-    touch nothing, warn, ``sys.exit(1)`` with the code update SKIPPED (also when the target is
-    missing). Returns ``(parked_branch_switched, in_place_update, switch_block_reason)``.
+    - if "update_in_place" configured OR branch is rmk/* integration branch: stash+merge allowed
+    - else: touch nothing, warn, ``sys.exit(1)`` with code update SKIPPED.
+    Returns ``(parked_branch_switched, in_place_update, switch_block_reason)``.
     """
     if current_branch == branch or current_branch == "HEAD":
         return False, False, None
+
+    # Check config FIRST: if "update_in_place" is configured, we can handle dirty trees
+    # via stash -> merge on clean committed history -> restore stash on merged result.
+    _in_place_configured = False
+    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
+        _in_place_configured = (
+            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
+
+    # RMK integration branches (rmk/*) are intentionally customized; their standard
+    # workflow is merge-based (evidence: rmk/integration-current-upstream is a merge branch
+    # with 25 unique commits). For these, default to update_in_place behavior even without
+    # explicit config, to preserve production RMK state.
+    _is_rmk_integration_branch = current_branch.startswith("rmk/")
+
+    if (_in_place_configured or _is_rmk_integration_branch) and not switch_branch:
+        # For update_in_place (explicit or RMK-default), skip the dirty/unverifiable block.
+        # The stash in _prepare_checkout_for_update will save local changes; the merge in
+        # _pull_updates/_reconcile_diverged_checkout runs on clean committed history; the
+        # restore applies stash on top of the merged result.
+        if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"origin/{branch}"]).returncode != 0:
+            print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+            sys.exit(1)
+        unmerged_count = None
+        switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
+            git_cmd, _m().PROJECT_ROOT, current_branch, branch)
+        if switch_safe and switch_block_reason.startswith("unmerged:"):
+            unmerged_count = switch_block_reason.split(":", 1)[1]
+        if unmerged_count and _is_rmk_integration_branch:
+            # Loud notice only for rmk/* integration branches: their unmerged
+            # commits are intentional customization, preserved by the in-place
+            # merge. Non-RMK in-place branches keep the original quiet message.
+            print(
+                f"\n{_BAR}\n"
+                f"⚠ Checkout is on RMK branch '{current_branch}' with "
+                f"{unmerged_count} commit(s) not in origin/{branch}.\n"
+                f"  Updating in place (merge origin/{branch}) — local commits preserved.\n"
+                f"  Local changes will be stashed, merged, then restored.\n"
+                f"  To pick the work back up later:\n    git checkout {current_branch}\n{_BAR}"
+            )
+        else:
+            print(
+                f"  ℹ On branch '{current_branch}' — updating it in place from "
+                f"origin/{branch} (no branch switch; local commits preserved)."
+            )
+        return False, True, switch_block_reason if unmerged_count else "dirty:update_in_place"
+
+    # Default path (switch strategy): strict assessment, no dirty allowed
     switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
         git_cmd, _m().PROJECT_ROOT, current_branch, branch)
     if not switch_safe:
@@ -858,15 +1010,11 @@ def _apply_parked_branch_guard(
             git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
         print()
         print(f"⚠ Update finished — code update SKIPPED{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _resume_windows_gateways_safely(_windows_gateway_resume)
         sys.exit(1)
     if not switch_block_reason.startswith("unmerged:"):
         print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
         return True, False, switch_block_reason
-    _in_place_configured = False
-    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _in_place_configured = (
-            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
     if not _in_place_configured or switch_branch:
         _m()._print_parked_branch_kept_notice(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
@@ -893,6 +1041,9 @@ def _prepare_checkout_for_update(
 
     if not in_place_update and current_branch == "HEAD" != branch:
         print(f"  ⚠ Currently on detached HEAD — switching to {branch} for update...")
+    # Capture pre-update working state BEFORE stashing, for the merge-conflict transaction's
+    # exact restoration verification (branch / HEAD / staged / worktree / untracked).
+    pre_update_state = _capture_worktree_state(git_cmd, _m().PROJECT_ROOT)
     auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
     if (
         not in_place_update and current_branch != branch
@@ -950,7 +1101,8 @@ def _prepare_checkout_for_update(
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
-        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked)
+        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
+        pre_update_state=pre_update_state)
 
 
 @dataclass
@@ -1384,7 +1536,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
-            keep_stash=opts.keep_stash)
+            keep_stash=opts.keep_stash, pre_update_state=_plan.pre_update_state,
+            _windows_gateway_resume=_windows_gateway_resume)
         _apply_pulled_update(
             git_cmd, branch, pre_pull_sha, _plan, opts, gateway_mode=gateway_mode,
             is_fork=is_fork, desktop_dir=desktop_dir,

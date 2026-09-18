@@ -32,6 +32,41 @@ _SESSION_TOKEN_KEYS = (
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
 
 
+def evaluate_skill_review_trigger(agent: Any) -> bool:
+    """Decide whether an automatic skill review should spawn after this turn.
+
+    1. Base cadence: ``_iters_since_skill >= _skill_nudge_interval`` (accrues across turns,
+       resets on a ``skill_manage`` call or a fired review) and the tool is available.
+    2. Per-session backoff: after consecutive unproductive reviews the effective interval
+       is multiplied (``review_backoff_multiplier``); a write or ``/refine`` resets it.
+    3. New-user-signal floor: at least ``_min_user_turns_between_skill_reviews`` new user
+       turns since the last skill review — so a long tool loop with no new user message
+       cannot keep firing reviews. ``0`` disables the floor (legacy behavior).
+
+    Side effects on a fire: resets ``_iters_since_skill`` and stamps
+    ``_user_turn_at_last_skill_review``. Always stamps ``_bg_review_backoff_multiplier``
+    when the base cadence is due (telemetry reads it). Shared by the chat-completions
+    finalizer and the codex runtime so the gate cannot diverge.
+    """
+    if not (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and getattr(agent, "_iters_since_skill", 0) >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", ())
+    ):
+        return False
+    from agent.background_review import review_backoff_multiplier
+
+    mult = review_backoff_multiplier(agent)
+    agent._bg_review_backoff_multiplier = mult
+    min_user_turns = getattr(agent, "_min_user_turns_between_skill_reviews", 1)
+    user_turns_since = getattr(agent, "_user_turn_count", 0) - getattr(agent, "_user_turn_at_last_skill_review", 0)
+    if agent._iters_since_skill >= agent._skill_nudge_interval * mult and user_turns_since >= min_user_turns:
+        agent._iters_since_skill = 0
+        agent._user_turn_at_last_skill_review = getattr(agent, "_user_turn_count", 0)
+        return True
+    return False
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -375,8 +410,7 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
         )
         if _is_empty_terminal or _is_partial_fragment or str(_turn_exit_reason) == "partial_stream_recovery":
             _explanation = agent._format_turn_completion_explanation(
-                _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
-                db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
+                _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None)
             )
             if _explanation:
                 # Replace the bare sentinel; keep a partial fragment and append why.
@@ -416,19 +450,18 @@ def _apply_output_hooks(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
-    # Detached forks are internal work and must not publish turns under the parent's session ID.
-    if not getattr(agent, "_persist_disabled", False):
-        _invoke_hook_safely(
-            "post_llm_call", logger,
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            assistant_response=final_response,
-            conversation_history=list(messages),
-            model=agent.model,
-            platform=platform,
-        )
+    # post_llm_call (e.g. sync conversation data to an external memory system).
+    _invoke_hook_safely(
+        "post_llm_call", logger,
+        session_id=agent.session_id,
+        task_id=effective_task_id,
+        turn_id=turn_id,
+        user_message=original_user_message,
+        assistant_response=final_response,
+        conversation_history=list(messages),
+        model=agent.model,
+        platform=platform,
+    )
     return final_response, transformed, pre_transform
 
 
@@ -552,12 +585,7 @@ def finalize_turn(
         "provider": agent.provider,
         "base_url": agent.base_url,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},
-        # Gateway SessionEntry persists an API reading, never the preflight display seed.
-        "last_prompt_tokens": (
-            getattr(agent.context_compressor, "last_real_prompt_tokens", agent.context_compressor.last_prompt_tokens)
-            if getattr(agent.context_compressor, "last_prompt_tokens", 0) > 0
-            else getattr(agent.context_compressor, "last_prompt_tokens", 0)
-        ) or 0,
+        "last_prompt_tokens": getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_COST_KEYS},
         # Requested service tier, for billing audits (`hermes -z --usage-file`).
         "service_tier": (
@@ -591,14 +619,9 @@ def finalize_turn(
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    )
-    if _should_review_skills:
-        agent._iters_since_skill = 0
+    # Skill review gate (shared with the codex runtime): base tool-iteration cadence, then the
+    # per-session backoff multiplier and the "new user turn since last skill review" floor.
+    _should_review_skills = evaluate_skill_review_trigger(agent)
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -624,19 +647,18 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    if not getattr(agent, "_persist_disabled", False):
-        _invoke_hook_safely(
-            "on_session_end", logger,
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=_platform,
-        )
+    _invoke_hook_safely(
+        "on_session_end", logger,
+        session_id=agent.session_id,
+        task_id=effective_task_id,
+        turn_id=turn_id,
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+        turn_exit_reason=_turn_exit_reason,
+        model=agent.model,
+        platform=_platform,
+    )
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

@@ -23,6 +23,7 @@ import {
   type McpTransport,
 } from "@/lib/mcp-server-create";
 import { cn } from "@/lib/utils";
+import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 
 // Profile name rule mirrors the backend (`^[a-z0-9][a-z0-9_-]{0,63}$`).
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -37,11 +38,6 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: "review", label: "Review" },
 ];
 
-interface ModelChoice {
-  provider: string;
-  model: string;
-  label: string;
-}
 
 /**
  * Dashboard-native, full-featured profile builder.
@@ -68,10 +64,14 @@ export default function ProfileBuilderPage() {
   const [description, setDescription] = useState("");
 
   // ── Step 2: model ─────────────────────────────────────────────────
-  const [modelChoices, setModelChoices] = useState<ModelChoice[] | null>(null);
-  const [modelChoice, setModelChoice] = useState(""); // `${provider}\u0000${model}`
-  const [modelFilter, setModelFilter] = useState("");
-  const modelLoading = useRef(false);
+  // Structured selection captured from the shared ModelPickerDialog; null =
+  // "use default" (model set after creation). The profile does not exist yet,
+  // so nothing is persisted until POST /api/profiles.
+  const [modelSel, setModelSel] = useState<{
+    provider: string;
+    model: string;
+  } | null>(null);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
 
   // ── Step 3: skills ────────────────────────────────────────────────
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -95,31 +95,6 @@ export default function ProfileBuilderPage() {
 
   const nameValid = PROFILE_NAME_RE.test(name.trim());
 
-  // Lazy-load model choices when the model step is first shown.
-  const loadModels = useCallback(() => {
-    if (modelChoices !== null || modelLoading.current) return;
-    modelLoading.current = true;
-    api
-      .getModelOptions()
-      .then((res) => {
-        const flat: ModelChoice[] = [];
-        for (const prov of res.providers ?? []) {
-          for (const m of prov.models ?? []) {
-            flat.push({
-              provider: prov.slug,
-              model: m,
-              label: `${prov.name} · ${m}`,
-            });
-          }
-        }
-        setModelChoices(flat);
-      })
-      .catch(() => setModelChoices([]))
-      .finally(() => {
-        modelLoading.current = false;
-      });
-  }, [modelChoices]);
-
   const loadSkills = useCallback(() => {
     if (skills !== null || skillsLoading.current) return;
     skillsLoading.current = true;
@@ -137,9 +112,10 @@ export default function ProfileBuilderPage() {
   }, [skills]);
 
   useEffect(() => {
-    if (step === "model") loadModels();
+    // The model step's provider/model inventory is loaded by ModelPickerDialog
+    // itself when opened — no page-level prefetch.
     if (step === "skills") loadSkills();
-  }, [step, loadModels, loadSkills]);
+  }, [step, loadSkills]);
 
   const runHubSearch = useCallback(() => {
     const q = hubQuery.trim();
@@ -211,13 +187,6 @@ export default function ProfileBuilderPage() {
     }));
   };
 
-  const filteredModels = useMemo(() => {
-    if (!modelChoices) return [];
-    const f = modelFilter.trim().toLowerCase();
-    if (!f) return modelChoices;
-    return modelChoices.filter((c) => c.label.toLowerCase().includes(f));
-  }, [modelChoices, modelFilter]);
-
   const filteredSkills = useMemo(() => {
     if (!skills) return [];
     const f = skillFilter.trim().toLowerCase();
@@ -229,16 +198,6 @@ export default function ProfileBuilderPage() {
         (s.category || "").toLowerCase().includes(f),
     );
   }, [skills, skillFilter]);
-
-  const pickedModel = useMemo(
-    () =>
-      modelChoice
-        ? modelChoices?.find(
-            (c) => `${c.provider}\u0000${c.model}` === modelChoice,
-          )
-        : undefined,
-    [modelChoice, modelChoices],
-  );
 
   const handleCreate = async () => {
     const n = name.trim();
@@ -253,8 +212,8 @@ export default function ProfileBuilderPage() {
         name: n,
         clone_from: null,
         description: description.trim() || undefined,
-        provider: pickedModel?.provider,
-        model: pickedModel?.model,
+        provider: modelSel?.provider,
+        model: modelSel?.model,
         mcp_servers: mcpServers.length ? mcpServers : undefined,
         keep_skills: keepAll ? undefined : Array.from(keptSkills),
         hub_skills: hubSkills.length
@@ -349,48 +308,24 @@ export default function ProfileBuilderPage() {
           {step === "model" && (
             <div className="space-y-3">
               <p className="text-sm text-muted-foreground">
-                Pick the model+provider for this profile. Skip to use the
-                default.
+                Pick the model + provider for this profile. Skip to set it
+                later.
               </p>
-              <Input
-                placeholder="Filter models…"
-                value={modelFilter}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                  setModelFilter(e.target.value)
-                }
-              />
-              {modelChoices === null ? (
-                <p className="text-sm text-muted-foreground">Loading models…</p>
-              ) : (
-                <div className="max-h-72 space-y-1 overflow-y-auto">
-                  <button
-                    onClick={() => setModelChoice("")}
-                    className={cn(
-                      "block w-full rounded px-3 py-2 text-left text-sm",
-                      modelChoice === "" ? "bg-primary/10" : "hover:bg-muted",
-                    )}
-                  >
+              <div className="flex flex-wrap items-center gap-2">
+                <Button outlined onClick={() => setModelPickerOpen(true)}>
+                  {modelSel ? "Change model" : "Choose model"}
+                </Button>
+                {modelSel && (
+                  <Button ghost onClick={() => setModelSel(null)}>
                     Use default (set later)
-                  </button>
-                  {filteredModels.map((c) => {
-                    const key = `${c.provider}\u0000${c.model}`;
-                    return (
-                      <button
-                        key={key}
-                        onClick={() => setModelChoice(key)}
-                        className={cn(
-                          "block w-full rounded px-3 py-2 text-left text-sm",
-                          modelChoice === key
-                            ? "bg-primary/10"
-                            : "hover:bg-muted",
-                        )}
-                      >
-                        {c.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+                  </Button>
+                )}
+              </div>
+              <p className="font-mono text-sm">
+                {modelSel
+                  ? `${modelSel.provider} · ${modelSel.model}`
+                  : "Use default (set later)"}
+              </p>
             </div>
           )}
 
@@ -758,7 +693,11 @@ export default function ProfileBuilderPage() {
               />
               <ReviewRow
                 label="Model"
-                value={pickedModel ? pickedModel.label : "Default (set later)"}
+                value={
+                  modelSel
+                    ? `${modelSel.provider} · ${modelSel.model}`
+                    : "Default (set later)"
+                }
               />
               <ReviewRow
                 label="Skills"
@@ -817,6 +756,24 @@ export default function ProfileBuilderPage() {
           </Button>
         )}
       </div>
+
+      {/*
+       * Same picker the default Models page uses. The profile does not exist
+       * yet, so onApply only captures the structured {provider, model}; the
+       * value rides along in the POST /api/profiles body. No inventory of our
+       * own — ModelPickerDialog loads /api/model/options.
+       */}
+      {modelPickerOpen && (
+        <ModelPickerDialog
+          title="Choose model"
+          alwaysGlobal
+          loader={(opts) => api.getModelOptions({ refresh: opts?.refresh })}
+          onApply={({ provider, model }) => {
+            setModelSel({ provider, model });
+          }}
+          onClose={() => setModelPickerOpen(false)}
+        />
+      )}
 
       <Toast toast={toast} />
     </div>

@@ -1067,6 +1067,57 @@ class SessionSchemaMixin:
         if current_version < SCHEMA_VERSION and fts_migrations_complete and fts5_available:
             cursor.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
+        # ============================================================
+        # Phase 0 — RMK Knowledge Ingestion Processing Ledger (v33)
+        # Creates processing_ledger table with Schema 33 columns and
+        # four canonical indexes. Runs once per state.db when
+        # SCHEMA_VERSION advances to 33.
+        # ============================================================
+        if current_version < 33:
+            # Create processing_ledger table with all Schema 33 columns
+            cursor.executescript("""
+                CREATE TABLE IF NOT EXISTS processing_ledger (
+                    file_id TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    source_abs_path TEXT NOT NULL,
+                    canonical_dir_hash TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    encoding TEXT NOT NULL,
+                    front_matter TEXT,
+                    body_sha256 TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 33,
+                    schema_valid INTEGER NOT NULL DEFAULT 0,
+                    schema_errors TEXT,
+                    title TEXT,
+                    tags TEXT,
+                    links TEXT,
+                    embeddings TEXT,
+                    word_count INTEGER,
+                    char_count INTEGER,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    last_error TEXT,
+                    last_attempt_at INTEGER,
+                    completed_at INTEGER,
+                    ingested_at INTEGER NOT NULL,
+                    ingested_by TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    source_identity TEXT NOT NULL,
+                    previous_file_id TEXT,
+                    superseded INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+
+            # Create the four canonical indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_state ON processing_ledger(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_adapter ON processing_ledger(source_identity)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_knowledge ON processing_ledger(canonical_dir_hash)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_retry ON processing_ledger(attempt, status)")
+
+            logger.info("Phase 0 migration: processing_ledger table and indexes created (Schema 33)")
+
     def _migrate_v22_session_model_usage(self, cursor: sqlite3.Cursor) -> None:
         """v22: ``task`` joins the session_model_usage PRIMARY KEY ('' = main loop; aux calls
         named). SQLite cannot ALTER a PK, so rebuild; existing rows → task=''."""

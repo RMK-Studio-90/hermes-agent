@@ -1,0 +1,52 @@
+{
+  "test1_production_error": {
+    "mode": "auto",
+    "route": [
+      "omniroute",
+      "cc/claude-opus-4-7"
+    ],
+    "error": "none",
+    "override_why": {
+      "source": "turn",
+      "mode": "strict",
+      "note": "target not eligible for logical_route -> auto"
+    },
+    "ranked": 7
+  },
+  "test2_routing_profile_active": {
+    "mode": "auto",
+    "route": [
+      "omniroute",
+      "cc/claude-opus-4-7"
+    ],
+    "error": "none",
+    "ranked": 7
+  },
+  "test3_manual_eligible_model": {
+    "mode": "override",
+    "route": [
+      "omniroute",
+      "cc/claude-opus-4-7"
+    ],
+    "error": "none",
+    "override_why": {
+      "source": "turn",
+      "mode": "strict",
+      "forced": true
+    }
+  },
+  "test4_no_logical_route": {
+    "mode": "override",
+    "route": [
+      null,
+      null
+    ],
+    "error": "NO_ELIGIBLE_MODEL",
+    "override_why": {
+      "source": "turn",
+      "mode": "strict",
+      "forced": true,
+      "note": "NO_ELIGIBLE_MODEL"
+    }
+  }
+}

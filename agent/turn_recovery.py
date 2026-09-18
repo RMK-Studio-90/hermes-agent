@@ -1228,7 +1228,7 @@ _OVERFLOW_REASONS = frozenset({
 _RATE_LIMIT_REASONS = frozenset({
     FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit,
 })
-_TRANSPORT_FAILURE_REASONS = frozenset({FailoverReason.timeout, FailoverReason.overloaded})
+_TRANSPORT_FAILURE_REASONS = frozenset({FailoverReason.timeout, FailoverReason.overloaded, FailoverReason.server_error})
 
 
 _LONG_CONTEXT_TIER_CAP = 200000
@@ -1407,8 +1407,11 @@ def route_classified_error(
                 return _verdict("break")
         # Compression exhausted or didn't help: fall through to normal error handling.
 
-    # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
-    # the retry window); transport errors get 1 retry first.
+    # Eager fallback: rate-limit/billing switch immediately (the primary won't
+    # recover in the retry window). Overloaded also fails over immediately — the
+    # route's health degrades (routing.health) so it is not re-selected while it
+    # recovers; beating a busy provider only widens the outage. Timeout and 5xx
+    # keep a small same-route budget (1 retry) first, then fail over. (P0)
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
     # Some relays wrap upstream output-cap 400s as 429 (rate_limit). Only the max_tokens
     # clamp fixes it. Parsed once; gates the eager-fallback exemption and overflow entry.
@@ -1428,9 +1431,13 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+    _transport_budget = (
+        1 if classified.reason == FailoverReason.overloaded
+        else 2  # timeout / server_error: one same-route retry, then fail over
+    )
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
-        or (_is_transport_failure and retry_count >= 2)
+        or (_is_transport_failure and retry_count >= _transport_budget)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an

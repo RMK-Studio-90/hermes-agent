@@ -117,7 +117,10 @@ class TestPreUpdateBackupIntegrityGuard:
         snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
         out = capsys.readouterr().out
         assert snap_id is not None
-        assert "Pre-update snapshot" in out
+        # Phase 6: the pre-update checkpoint is now a SafeState ("Pre-update
+        # SafeState:", see _run_quick_snapshots/create_safestate), not the
+        # legacy "Pre-update snapshot" wording.
+        assert "Pre-update SafeState" in out
         assert "integrity check FAILED" not in out
 
     def test_zeroed_db_after_snapshot_is_loud(self, hermes_home, capsys, monkeypatch):

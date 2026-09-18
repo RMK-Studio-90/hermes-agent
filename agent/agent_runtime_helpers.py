@@ -1958,6 +1958,17 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
     agent.client = agent._create_openai_client(dict(agent._client_kwargs), reason="switch_model", shared=True)
 
 
+class SwitchEndpointUnresolvedError(ValueError):
+    """switch_model target's provider connection could not be resolved (P1-1).
+
+    Raised when a genuine provider change arrives with no usable ``base_url``.
+    Subclasses :class:`ValueError` so every existing caller and regression test
+    of the fail-loud contract (``#47828``) keeps working unchanged, while the
+    routing fail-safe guard gets an exact, non-string-matched condition to
+    catch — unrelated provider/programming errors must never match it.
+    """
+
+
 def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm) -> None:
     """Swap identity/transport fields, reload the pool, rebuild the client (rolled back by the caller on error)."""
     # Clear the per-config override so the new model's context window is re-resolved.
@@ -1972,7 +1983,7 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
     if base_url:
         agent.base_url = base_url
     elif old_norm != new_norm:
-        raise ValueError(
+        raise SwitchEndpointUnresolvedError(
             f"switch_model: no base_url resolved for provider "
             f"'{new_provider}' (switching from '{old_provider}'); "
             "refusing to keep the previous provider's endpoint"
@@ -2146,7 +2157,9 @@ def switch_model(
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    snapshot and re-raises (callers catch). A provider change with no resolvable endpoint
+    raises :class:`SwitchEndpointUnresolvedError` (a ``ValueError`` subclass): routing's P1-1
+    fail-safe catches exactly that and continues failover; unrelated errors propagate."""
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,

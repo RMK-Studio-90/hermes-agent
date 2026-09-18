@@ -575,6 +575,9 @@ class CLIAgentSetupMixin:
             # ``cli._active_agent_ref`` None forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            # Passing the configured default into AIAgent is not a user pin.
+            self.agent._routing_explicit_model = bool(
+                model_override or getattr(self, "_explicit_model_override", False))
             # Route agent status output through prompt_toolkit so ANSI escapes aren't garbled by
             # patch_stdout's StdoutProxy (#2262), holding lines while a response box streams so a
             # subagent/background completion notice never splits the reply mid-paragraph.

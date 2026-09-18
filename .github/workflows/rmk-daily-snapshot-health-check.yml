@@ -1,0 +1,37 @@
+name: RMK Daily Snapshot Health Check
+
+# Repository-side health check ONLY. This does NOT back up the local
+# Windows worktree — the actual snapshot mechanism is a local Windows
+# Scheduled Task (tools/rmk-daily-git-snapshot.ps1) that runs on the
+# machine itself, because GitHub Actions cannot see unpushed local
+# changes. This workflow only warns if no recent snapshot commit has
+# reached this remote, as a sanity signal that the local task is
+# actually running and pushing.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # once/day, well after the 21:30 local snapshot run
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check-recent-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (shallow, full history for log search)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Look for a recent "chore(snapshot)" commit
+        run: |
+          set -e
+          RECENT=$(git log --since="48 hours ago" --all --grep='^chore(snapshot):' --oneline | head -5)
+          if [ -z "$RECENT" ]; then
+            echo "::warning::No 'chore(snapshot): ...' commit found on any branch in the last 48 hours. The local RMK-Hermes-Daily-Git-Snapshot Windows scheduled task may not be running or pushing."
+          else
+            echo "Recent snapshot commit(s) found:"
+            echo "$RECENT"
+          fi

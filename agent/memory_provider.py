@@ -99,6 +99,16 @@ class MemoryProvider(ABC):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall after each turn; prefetch() consumes it next turn."""
 
+    def take_tool_context(self, query: str, *, session_id: str = "") -> Optional[Dict[str, Any]]:
+        """Consume already-prefetched context as an automatic tool result, without network I/O.
+
+        Opt-in alternative to returning user-message context from prefetch(). Return
+        {"name": an exposed provider tool, "content": text, "arguments": dict}, or None.
+        The host records a matching assistant tool call/result in the transcript so
+        provenance and prefix-cache replay survive session persistence.
+        """
+        return None
+
     def recall_status(self) -> Optional[RecallStatus]:
         """What the most recent :meth:`prefetch` injected (``None`` = no indicator). Must reflect
         only the LAST prefetch, never a stale prior count."""

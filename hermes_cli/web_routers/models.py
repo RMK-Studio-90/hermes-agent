@@ -293,3 +293,63 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                 return _apply_model_assignment_sync(scope, provider, model, task, base_url, api_key)
 
         return await asyncio.to_thread(_apply_assignment)
+
+
+@router.post("/api/model/routing-profile")
+async def set_routing_profile(body: dict, profile: Optional[str] = None):
+    """Set the adaptive routing profile. When set, the router operates in full-auto mode.
+    Body: {"profile": "rmk-smart" | "rmk-fast" | "rmk-code" | "rmk-reason" | "rmk-general" | "rmk-research" | "rmk-vision" | ""}
+    Empty string clears the routing profile (restores legacy pinned-model behavior).
+    """
+    from hermes_cli.web_routers._common import http_failure
+
+    target_profile = str(body.get("profile", "")).strip()
+    valid = {"rmk-smart", "rmk-fast", "rmk-code", "rmk-reason", "rmk-general", "rmk-research", "rmk-vision", ""}
+    if target_profile not in valid:
+        raise HTTPException(status_code=400, detail=f"invalid routing profile: {target_profile}; valid: {', '.join(sorted(v for v in valid if v))}")
+
+    with http_failure("POST /api/model/routing-profile failed", 500, detail="Failed to set routing profile"):
+        def _apply():
+            # `profile` is the Hermes configuration scope.
+            # `target_profile` is the RMK routing-mode slug.
+            # Never use an RMK routing slug (for example rmk-smart)
+            # as a Hermes configuration profile name.
+            with _profile_scope(profile):
+                cfg = load_config()
+
+                routing = cfg.get("routing")
+                if not isinstance(routing, dict):
+                    routing = {}
+                    cfg["routing"] = routing
+
+                adaptive = routing.get("adaptive")
+                if not isinstance(adaptive, dict):
+                    adaptive = {
+                        "enabled": False,
+                        "registry": "routing/registry.json",
+                        "allow_paid": False,
+                    }
+                    routing["adaptive"] = adaptive
+
+                if target_profile:
+                    # Selecting AUTO / ROUTING intentionally enables the
+                    # adaptive router.
+                    adaptive["enabled"] = True
+                    routing["profile"] = target_profile
+                else:
+                    # Selecting a physical model restores strict pinned-model
+                    # behaviour. Merely deleting routing.profile is insufficient
+                    # because effective_routing_profile() otherwise falls back
+                    # to rmk-smart while adaptive routing remains enabled.
+                    routing.pop("profile", None)
+                    adaptive["enabled"] = False
+
+                save_config(cfg)
+
+                return {
+                    "ok": True,
+                    "profile": target_profile or None,
+                    "adaptive_enabled": bool(adaptive.get("enabled")),
+                }
+
+        return await asyncio.to_thread(_apply)

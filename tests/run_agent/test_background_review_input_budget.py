@@ -144,11 +144,36 @@ def _run_with_responses(agent, responses):
     return result
 
 
-def test_review_input_budget_stops_tool_loop_before_next_provider_call():
-    """Once a fork's cumulative input crosses its budget, no further provider
-    call is made — the crossing request completes, then the loop stops."""
+def test_review_input_budget_predictive_stops_before_crossing():
+    """STEP 5: the loop stops BEFORE the request that would cross the budget.
+    After call 1 (50k billed), the running average predicts call 2 (~57.5k with
+    margin) would push past 100k, so call 2 is never made."""
+    agent = _make_loop_agent()
+    agent._review_input_token_budget = 100_000  # _review_predictive_budget defaults True
+
+    responses = [
+        _tool_response(50_000),
+        _tool_response(50_000),  # predicted to cross -> must NOT be consumed
+        _tool_response(50_000),
+        _final_response(),
+    ]
+    result = _run_with_responses(agent, responses)
+
+    create = agent.client.chat.completions.create
+    assert create.call_count == 1, (
+        f"predictive preflight should stop before the crossing request; "
+        f"{create.call_count} calls made (used {agent.session_input_tokens})"
+    )
+    assert agent.session_input_tokens == 50_000
+    assert result["completed"] is False
+
+
+def test_review_input_budget_legacy_post_hoc_stops_after_crossing():
+    """_review_predictive_budget=False restores the pre-STEP-5 behavior: the
+    budget-crossing request completes, then the loop stops."""
     agent = _make_loop_agent()
     agent._review_input_token_budget = 100_000
+    agent._review_predictive_budget = False
 
     responses = [
         _tool_response(50_000),
@@ -158,15 +183,33 @@ def test_review_input_budget_stops_tool_loop_before_next_provider_call():
     ]
     result = _run_with_responses(agent, responses)
 
-    create = agent.client.chat.completions.create
-    assert create.call_count == 2, (
-        f"expected the loop to stop after crossing the input budget, "
-        f"but {create.call_count} provider calls were made (budget "
-        f"{agent._review_input_token_budget}, "
-        f"used {agent.session_input_tokens})"
-    )
+    assert agent.client.chat.completions.create.call_count == 2
     assert agent.session_input_tokens == 100_000
     assert result["completed"] is False
+
+
+def test_review_max_context_tokens_caps_billed_plus_cache_read():
+    """max_context_tokens gates on billed_input + cache_read even when the
+    billed-only budget still has room (assembled-context pressure lever)."""
+    from agent.conversation_loop import _review_input_budget_exhausted
+
+    class _A:
+        _review_input_token_budget = 10_000_000     # billed budget never binds
+        _review_max_context_tokens = 120_000
+        _review_predictive_budget = False
+        session_input_tokens = 40_000
+        session_cache_read_tokens = 79_999
+        _api_call_count = 2
+
+    a = _A()
+    assert _review_input_budget_exhausted(a) is False   # 119,999 < 120,000
+    a.session_cache_read_tokens = 80_000
+    assert _review_input_budget_exhausted(a) is True     # 120,000 >= 120,000
+
+    # cap of 0 disables the context lever
+    a._review_max_context_tokens = 0
+    a.session_cache_read_tokens = 10_000_000
+    assert _review_input_budget_exhausted(a) is False
 
 
 def test_no_budget_attribute_leaves_tool_loop_unbounded():

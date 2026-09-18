@@ -374,12 +374,40 @@ def _build_children(
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
     }
+    # BUILD-04 / K08 §17: Operating-Brain injection gate. The feature flag
+    # delegation.operating_brain.enabled defaults to false/absent -> context is
+    # byte-identical to the K02 F1 baseline (AC1/AC5). Only 'rmk.ob.v1' injects.
+    ob_mode = None
+    try:
+        from hermes_cli.operating_brain import apply_operating_brain, config_enabled, emit_activation_event
+        from hermes_cli.operating_brain import OperatingBrainBudgetExceeded as _OBBudget
+        ob_mode = config_enabled(_load_config())
+    except Exception:
+        ob_mode = None  # import/config error -> baseline behavior (flag absent)
+    if ob_mode not in (None, "rmk.ob.v1"):
+        return [], (
+            f"BLOCKED_DATA_QUALITY: unknown delegation.operating_brain.enabled={ob_mode!r}; "
+            f"expected absent/false or 'rmk.ob.v1' (K08 §17.1). Refusing spawn."
+        )
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        if ob_mode == "rmk.ob.v1":
+            try:
+                _child_context, ob_audit = apply_operating_brain(_child_context, enabled=ob_mode)
+            except _OBBudget as exc:
+                return [], f"BLOCKED_DATA_QUALITY: {exc}"
+            if ob_audit:
+                # AC4 (K08 §17.6): SecurityEvent kind=policy_change. The runtime
+                # audit-store connection is resolved at deploy/release wiring;
+                # without one the event is logged (never fabricated).
+                try:
+                    emit_activation_event(ob_audit)
+                except Exception as exc:  # pragma: no cover - env dependent
+                    logger.warning("operating_brain activation event failed: %s", exc)
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,

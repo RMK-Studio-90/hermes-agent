@@ -1,0 +1,14 @@
+{
+  "exhausted": false,
+  "route": [
+    "test",
+    "paid"
+  ],
+  "error": null,
+  "override_why": {
+    "source": "auto",
+    "mode": "strict",
+    "forced": true
+  },
+  "logical_route": null
+}

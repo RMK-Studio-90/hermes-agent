@@ -1824,6 +1824,59 @@ class CLICommandsMixin:
         if output:
             print(output)
 
+    # ---- /rmk-safestate -----------------------------------------------------------------
+    def _handle_rmk_safestate_command(self, cmd: str):
+        """Handle /rmk-safestate [create [label]|verify [id]|list|restore <id>] — RMK SafeState."""
+        from hermes_cli.rmk_safestate import (
+            create_safestate, verify_safestate, list_safestates, restore_safestate,
+        )
+        parts = cmd.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else "list"
+        if subcmd == "create":
+            label = " ".join(parts[2:]) or None
+            res = create_safestate(label=label)
+            if res.get("success"):
+                print(f"  ✅ {res['summary']}")
+            else:
+                print(f"  ⚠ SafeState failed: {res.get('error', res)}")
+            return
+        if subcmd == "verify":
+            snap = parts[2].lower() if len(parts) > 2 else "latest"
+            res = verify_safestate(snap)
+            if "error" in res:
+                print(f"  ⚠ {res['error']}")
+                return
+            print(f"  SafeState verify ({res['snapshot_id']}): "
+                  f"{'PASS' if res['success'] else 'FAIL'}")
+            for c in res.get("checks", []):
+                mark = "✅" if c["ok"] else "❌"
+                print(f"    {mark} {c['name']}: {c['detail']}")
+            return
+        if subcmd == "restore":
+            if len(parts) < 3:
+                print("  Usage: /rmk-safestate restore <snapshot-id> [--dry-run]")
+                return
+            snap = parts[2]
+            state_mode = "dry" if (len(parts) > 3 and parts[3] == "--dry-run") else "live"
+            res = restore_safestate(snap, state_mode=state_mode)
+            sr, cr = res.get("state_result", {}), res.get("code_result", {})
+            print(f"  SafeState restore {res['snap_id']}: state="
+                  f"{'OK' if sr.get('success') else 'SKIP/FAIL'} "
+                  f"({sr.get('mode', '?')}), code={cr.get('detail', 'skipped')}")
+            return
+        # list
+        snaps = list_safestates(limit=25)
+        if not snaps:
+            print("  No SafeState checkpoints yet — run /rmk-safestate create")
+            return
+        print("  RMK SafeState checkpoints:\n")
+        usage = "  create|verify|restore: /rmk-safestate create [label] | verify [id] | restore <id> [--dry-run]"
+        for i, s in enumerate(snaps, 1):
+            git = f" {s.get('git_branch', '?')}@{s.get('git_sha', '?')}" if s.get("has_rmk") else ""
+            rmk = "rmk" if s.get("has_rmk") else "state"
+            print(f"  {i:3}  {s['id']:<35} [{rmk:<5}]{git}")
+        print(usage)
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub, after intercepting the
         write-approval review subcommands (pending/approve/reject/diff/mode)."""
@@ -2245,6 +2298,10 @@ class CLICommandsMixin:
         _cp(f"  {format_dispatch_note(result, prompt)}")
 
     # ---- /goal, /loop, /subgoal -----------------------------------------------------------
+    def _handle_graph_command(self, cmd: str) -> None:
+        """Enter the shared, tool-free graph clarification turn."""
+        self._queue_prompt_turn(cmd, "/graph")
+
     def _handle_goal_command(self, cmd: str) -> None:
         from hermes_cli.goal_command import dispatch_goal_command
         from hermes_cli.goals import last_user_message_content

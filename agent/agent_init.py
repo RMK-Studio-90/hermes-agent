@@ -1234,6 +1234,11 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    # Background-review pacing (STEP 3/4): per-session unproductive-review backoff multiplier
+    # and the "new user turn since last skill review" floor.
+    agent._bg_review_backoff_multiplier = 1
+    agent._user_turn_at_last_skill_review = 0
+    agent._min_user_turns_between_skill_reviews = 1
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
     # built-in store so the memory tool never sees store=None.
     # Flush/background agents can still pass enabled_toolsets=["memory"] so the built-in file store exists
@@ -1302,6 +1307,12 @@ def _apply_agent_section(agent, _agent_cfg):
     agent._skill_nudge_interval = 10
     with suppress(Exception):
         agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
+    # Skill review needs this many new USER turns since the last one (0 = legacy: no floor).
+    with suppress(Exception):
+        agent._min_user_turns_between_skill_reviews = max(0, int(
+            _agent_cfg.get("auxiliary", {}).get("background_review", {})
+            .get("min_user_turns_between_skill_reviews", 1)
+        ))
 
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(
@@ -2219,6 +2230,10 @@ def init_agent(
         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
     """
     _install_safe_stdio()
+
+    # Constructor model arguments are explicit pins; an omitted model permits
+    # adaptive selection from the configured primary/fallback routes.
+    agent._routing_explicit_model = bool(model)
 
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:

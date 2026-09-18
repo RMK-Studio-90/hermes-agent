@@ -81,7 +81,8 @@ export function isCanonicalChatOnScreen(
 async function openStoredBotChat(
   owner: RosterRow | string,
   storedId: string,
-  summary: CanonicalChatRow
+  summary: CanonicalChatRow,
+  intentSource: 'background' | 'user' = 'user'
 ): Promise<string> {
   if (!storedId || typeof host.openSession !== 'function') {
     throw new Error('This Hermes Desktop version cannot open stored sessions')
@@ -118,6 +119,7 @@ async function openStoredBotChat(
           route
         }
       : {}),
+    intentSource,
     profile: name,
     // Same intent a session row click uses. `tab` stacked a fresh tile every
     // time focusOpenSession missed, so bot chats piled up beside each other and
@@ -157,6 +159,17 @@ function botModeGatewayNeedsUpdate(error: unknown) {
   return /(?:method not found|no handler for|unknown method|unsupported rpc)/i.test(message)
 }
 
+/** The main-process backend pool is at its concurrency cap and every pooled
+ *  backend is mid-turn, so no slot could be freed for this open (see
+ *  spawnPoolBackend in electron/main.ts). This is a capacity condition, not an
+ *  unreachable gateway — surface the actionable wording verbatim rather than
+ *  the caller's generic "could not reach" fallback. */
+function botBackendPoolExhausted(error: unknown): null | string {
+  const message = String((error as RpcErrorLike)?.message || error || '')
+
+  return /bot backends are busy|free (local )?slot/i.test(message) ? message : null
+}
+
 export function notifyBotOpenFailure(error: unknown, bot: RosterRow, fallbackMessage: string) {
   if (botModeGatewayNeedsUpdate(error)) {
     const gateway = bot.connectionLabel || bot.connectionId || 'this gateway'
@@ -164,6 +177,18 @@ export function notifyBotOpenFailure(error: unknown, bot: RosterRow, fallbackMes
       kind: 'error',
       title: 'Update this gateway to use Bot Mode',
       message: `Update ${gateway}, then try again.`
+    })
+
+    return
+  }
+
+  const poolExhausted = botBackendPoolExhausted(error)
+
+  if (poolExhausted) {
+    host.notify?.({
+      kind: 'error',
+      title: 'Too many bot backends running',
+      message: poolExhausted
     })
 
     return
@@ -235,6 +260,10 @@ async function findExistingCanonicalChat(owner: RosterRow | string): Promise<Can
 }
 
 interface CreateCanonicalChatOptions {
+  /** Threaded through to every host.openSession this creation issues so a
+   *  background refresh that falls through to create (rare — the chat almost
+   *  always exists) still cannot bump the user-selection generation. */
+  intentSource?: 'background' | 'user'
   kickoff?: boolean
   openingStillCurrent?: (() => boolean) | null
 }
@@ -289,7 +318,7 @@ function kickoffText(): string {
  *  rail in a bot chat until the next click re-opened it scoped. */
 export function createCanonicalChat(
   owner: RosterRow | string,
-  { kickoff = false, openingStillCurrent = null }: CreateCanonicalChatOptions = {}
+  { intentSource = 'user', kickoff = false, openingStillCurrent = null }: CreateCanonicalChatOptions = {}
 ): Promise<null | string> {
   const { bot, name, key, route } = botOwner(owner)
   const inflight = canonicalCreations.get(key)
@@ -304,6 +333,7 @@ export function createCanonicalChat(
             route
           }
         : {}),
+      intentSource,
       profile: name,
       intent: 'main',
       keepAllProfilesScope: route ? true : false,
@@ -339,7 +369,7 @@ export function createCanonicalChat(
       if (typeof host.openSession === 'function' && canNavigate()) {
         // The exact-lookup gateway reports the compression-lineage tip as
         // resolved_id; open the tip, the registry row stays the identity.
-        await openStoredBotChat(owner, existing.resolved_id || existing.id, existing)
+        await openStoredBotChat(owner, existing.resolved_id || existing.id, existing, intentSource)
       }
 
       return existing.id
@@ -402,7 +432,7 @@ export function createCanonicalChat(
             // round-trip after the user clicked another bot, and every sibling
             // open here is staleness-probed for exactly that reason.
             if (typeof host.openSession === 'function' && canNavigate()) {
-              await openStoredBotChat(owner, winner.resolved_id || winner.id, winner)
+              await openStoredBotChat(owner, winner.resolved_id || winner.id, winner, intentSource)
             }
 
             return winner.id
@@ -484,7 +514,8 @@ export function createCanonicalChat(
  *  bot's chat opens without re-homing Desktop's chrome. */
 export async function openBotCanonicalChat(
   owner: RosterRow | string,
-  openingStillCurrent: (() => boolean) | null = null
+  openingStillCurrent: (() => boolean) | null = null,
+  { intentSource = 'user' }: { intentSource?: 'background' | 'user' } = {}
 ): Promise<{ openedId: string; registryId: string } | null> {
   const existing = await findExistingCanonicalChat(owner)
 
@@ -494,7 +525,7 @@ export async function openBotCanonicalChat(
     }
 
     const openedId = existing.resolved_id || existing.id
-    await openStoredBotChat(owner, openedId, existing)
+    await openStoredBotChat(owner, openedId, existing, intentSource)
 
     // Both identities matter downstream: the durable registry row names the
     // chat; the resolved lineage tip is what actually takes session focus.
@@ -507,6 +538,7 @@ export async function openBotCanonicalChat(
   }
 
   const created = await createCanonicalChat(owner, {
+    intentSource,
     openingStillCurrent
   })
 

@@ -219,6 +219,26 @@ export function ModelMenuPanel({
     // switch never hits the primary (busy) session by accident.
     select: (model, provider) => onSelectModel({ model, provider, sessionId: activeSessionId || null }),
 
+    // An AUTO / ROUTING entry commits routing.profile: the router returns to
+    // full-auto from the full registry pool and any previous physical-model pin
+    // is dropped (the gateway handler clears the agent override markers). The
+    // catalog refetch repaints the routing_profile marker so the checkmark
+    // lands on the just-chosen profile.
+    selectRoutingProfile: async profile => {
+      try {
+        await requestGateway('config.set', {
+          key: 'routing.profile',
+          session_id: activeSessionId || null,
+          value: profile
+        })
+        void queryClient.invalidateQueries({ queryKey: ['model-options'] })
+        return true
+      } catch (err) {
+        notifyError(err, t.shell.modelOptions.updateFailed)
+        return false
+      }
+    },
+
     setOptions: (patch, row) => {
       // Editing always records the model's global preset (keyed by
       // provider::model, not per-surface — a tile edit re-applies to that model

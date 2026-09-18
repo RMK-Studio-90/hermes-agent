@@ -1772,7 +1772,10 @@ class TestRunPreUpdateBackup:
         snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
         out = capsys.readouterr().out
         assert snap_id is not None
-        assert "Pre-update snapshot" in out
+        # Phase 6: the pre-update checkpoint is now a SafeState ("Pre-update
+        # SafeState:", see _run_quick_snapshots/create_safestate), not the
+        # legacy "Pre-update snapshot" wording.
+        assert "Pre-update SafeState" in out
         assert "Creating pre-update backup" in out
         assert len(self._zips(hermes_home)) == 1
 

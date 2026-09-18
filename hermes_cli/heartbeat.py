@@ -116,6 +116,46 @@ def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
     return None if state is None or state.status == "cleared" else state
 
 
+_META_PREFIX = "heartbeat:"
+
+
+def active_heartbeat_session_ids() -> set:
+    """``{session_id, ...}`` for every ACTIVE heartbeat in the CURRENT profile's DB — one query.
+
+    The gateway's restore poller runs every ``POLL_SECONDS`` and used to ask
+    :func:`load_heartbeat` once per known session, i.e. one ``state_meta`` SELECT per session
+    per tick (O(sessions) x poll rate). This is the same read expressed as a single prefix
+    scan, mirroring :func:`hermes_cli.loops.list_active_loops`.
+
+    Semantics are identical to ``HeartbeatManager(sid).is_active()``: a row is included only
+    when it parses AND its status is exactly ``active`` — ``paused``/``cleared`` and malformed
+    rows are excluded (fail closed). Returns an empty set on any DB error, so a failed read
+    can never be mistaken for "no heartbeats" by a caller that prunes — the caller must treat
+    empty as "nothing to add", never as "remove what I have" (see restore_heartbeat_watches).
+    """
+    db = _get_session_db()
+    if db is None:
+        return set()
+    try:
+        rows = db.list_meta_prefix(_META_PREFIX)
+    except Exception as exc:
+        logger.debug("HeartbeatManager: list_meta_prefix failed: %s", exc)
+        return set()
+    active = set()
+    for key, raw in rows:
+        session_id = key[len(_META_PREFIX):]
+        if not session_id or not raw:
+            continue
+        try:
+            state = HeartbeatState.from_json(raw)
+        except Exception as exc:
+            logger.warning("HeartbeatManager: could not parse stored heartbeat for %s: %s", session_id, exc)
+            continue
+        if state.status == "active":
+            active.add(session_id)
+    return active
+
+
 def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
     if not session_id:
         return
@@ -252,7 +292,8 @@ def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bo
 
 __all__ = [
     "HeartbeatState", "HeartbeatManager", "parse_interval", "format_interval", "load_heartbeat", "save_heartbeat",
-    "migrate_heartbeat_to_session", "HEARTBEAT_PROMPT_TEMPLATE", "MIN_INTERVAL_SECONDS", "POLL_SECONDS",
+    "migrate_heartbeat_to_session", "active_heartbeat_session_ids",
+    "HEARTBEAT_PROMPT_TEMPLATE", "MIN_INTERVAL_SECONDS", "POLL_SECONDS",
 ]
 
 

@@ -132,7 +132,7 @@ def _set_model(rid, params, key, value, session):
                 return init_err
         with _session_profile_runtime_scope(session):
             result = _apply_model_switch(sid, session, value, confirm_expensive_model=confirmed,
-                                         parsed_flags=parsed_flags)
+                                         parsed_flags=parsed_flags, manual_selection=True)
         if failed_agent_init and not result.get("confirm_required"):
             _restart_completed_failed_agent_build(sid, session, failed_ready)
             if init_err := _cfgset_await_agent(session, rid):
@@ -443,6 +443,47 @@ def _set_skin(rid, params, key, value, session):
     return _kv(rid, key, value)
 
 
+@_cfgset_guarded
+def _set_routing_profile(rid, params, key, value, session):
+    """Set the adaptive routing profile (routing.profile).
+
+    Valid values: "rmk-smart", "rmk-fast", "rmk-code", "rmk-reason", "rmk-general", "rmk-research", "rmk-vision", "" (clear)
+    When a routing profile is set, the router operates in full-auto mode every turn.
+    Clearing the profile (empty value) restores legacy behavior (current model pinned).
+    """
+    raw = str(value or "").strip()
+    valid_profiles = {"rmk-smart", "rmk-fast", "rmk-code", "rmk-reason", "rmk-general", "rmk-research", "rmk-vision", ""}
+    if raw not in valid_profiles:
+        return _err(rid, 4002, f"unknown routing profile: {value}; valid: {', '.join(sorted(v for v in valid_profiles if v))}")
+    cfg = _load_cfg_raw()
+    routing = cfg.get("routing")
+    if not isinstance(routing, dict):
+        routing = {"adaptive": {"enabled": True, "registry": "routing/registry.json", "allow_paid": False}}
+        cfg["routing"] = routing
+    if "adaptive" not in routing or not isinstance(routing["adaptive"], dict):
+        routing["adaptive"] = {"enabled": True, "registry": "routing/registry.json", "allow_paid": False}
+    routing["adaptive"]["enabled"] = True
+    if raw:
+        routing["profile"] = raw
+    else:
+        routing.pop("profile", None)
+    _save_cfg(cfg)
+    # Selecting a routing profile removes any previous physical-model pin: the
+    # router returns to full-auto from the full registry pool (TEST H of the
+    # routing-profile dropdown integration).
+    agent = session.get("agent") if session else None
+    if agent is not None:
+        try:
+            from agent.routing.integration import clear_manual_model_pin
+            clear_manual_model_pin(agent)
+        except Exception:
+            pass
+    # Emit session info for live agent to re-read config on next turn
+    if session:
+        _emit_session_info(params.get("session_id", ""), session)
+    return _kv(rid, key, raw)
+
+
 def _set_display_toggle(rid, params, key, value, session):
     on = _BOOL_WORDS.get(str(value).strip().lower())
     if on is None:
@@ -460,7 +501,8 @@ _CONFIG_SETTERS = {
     "density": _set_toggle, "battery": _set_toggle, "theme": _set_word,
     "statusbar": _set_toggle, "mouse": _set_toggle, "indicator": _set_word,
     "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd,
-    "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin}
+    "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin,
+    "routing.profile": _set_routing_profile}
 
 
 @method("config.set")

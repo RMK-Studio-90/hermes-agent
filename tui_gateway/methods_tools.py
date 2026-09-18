@@ -786,7 +786,12 @@ def _cmd_compress(rid, params, session, name, arg):
         return _err(rid, 5009, f"compress failed: {exc}")
 
 
+def _cmd_graph(rid, params, session, name, arg):
+    return _ok(rid, {"type": "send", "message": "/graph" + (" " + arg if arg else "")})
+
+
 _SLASH_BUILTINS = {
+    "graph": _cmd_graph,
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
     "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
     "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,

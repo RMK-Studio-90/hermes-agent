@@ -40,6 +40,7 @@ class FailoverReason(enum.Enum):
     image_corrupt = "image_corrupt"       # Provider can't decode image bytes — strip and retry (shrinking won't help)
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
+    connection_unresolved = "connection_unresolved"  # Routing candidate's provider connection/endpoint could not be resolved (P1-1) — skip candidate, fail over
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — don't retry unchanged
     format_error = "format_error"        # 400 bad request — abort or strip + retry
     invalid_encrypted_content = "invalid_encrypted_content"  # Responses replay blob rejected — strip replay state and retry
@@ -129,6 +130,19 @@ _OVERLOADED_PATTERNS = (
     "server overload", "server_overload",
     "service overloaded", "service is overloaded", "upstream overloaded", "currently overloaded",
     "at capacity", "over capacity",
+)
+
+# Provider/endpoint unavailable with NO status attached (a proxy/SSE frame that
+# strips the HTTP code). These are the message-level equivalents of 503/529 —
+# which the status handler already maps to overloaded — so they must land on the
+# same canonical class: back off, degrade health, fail over on retry; never
+# rotate the credential. Narrow by construction: names the *service/provider/
+# gateway*, never a model ("model not available" stays model_not_found).
+_UNAVAILABLE_PATTERNS = (
+    "service unavailable", "service is unavailable", "is temporarily unavailable", "temporarily unavailable",
+    "provider unavailable", "provider is unavailable", "upstream provider is unavailable",
+    "bad gateway", "gateway unavailable", "gateway is unavailable",
+    "endpoint unavailable", "endpoint is unavailable", "not available at the moment",
 )
 
 # Usage-limit patterns that need disambiguation (billing OR rate_limit), and
@@ -378,7 +392,11 @@ _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, retryable=False)
 _V_SSL_CERT = _v(_R.ssl_cert_verification, retryable=False)
 _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
 _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
-_V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
+# Overload: fail over rather than dead-end on a busy provider. This is the P0
+# production gap — "Service temporarily overloaded" (429/503/529) reached the
+# retry loop with should_fallback=False and stopped at "Retry / Switch provider".
+_V_OVERLOADED = _v(_R.overloaded, should_fallback=True)
+_V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.server_error, _R.timeout, _R.unknown))
 _V_IMAGE_TOO_LARGE, _V_IMAGE_CORRUPT = _v(_R.image_too_large), _v(_R.image_corrupt)
 _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported), _v(_R.invalid_encrypted_content)
 _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
@@ -438,7 +456,7 @@ _MESSAGE_HEAD_RULES = ((_MEMORY_CEILING_PATTERNS, _V_OVERLOADED),
 # instead of rotating; policy block before model_not_found; timeout/connection
 # wording last, classified as transport (never compression).
 _MESSAGE_TAIL_RULES = (
-    (_OVERLOADED_PATTERNS, _V_OVERLOADED), (_BILLING_PATTERNS, _billing_hints),
+    (_OVERLOADED_PATTERNS + _UNAVAILABLE_PATTERNS, _V_OVERLOADED), (_BILLING_PATTERNS, _billing_hints),
     (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT), (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _V_SERVER_ERROR),
     (_CONTEXT_OVERFLOW_PATTERNS, _V_CONTEXT_OVERFLOW), (_AUTH_PATTERNS, _V_AUTH_ROTATE),
     (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED), (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),

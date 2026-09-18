@@ -125,7 +125,14 @@ function refreshOpenBotChat(bot: RosterRow, { allowWhileBusy = false }: { allowW
   }
 
   const generation = getBotOpenGeneration()
-  void openBotCanonicalChat(bot, () => generation === getBotOpenGeneration()).catch(() => {
+  // A poll-driven transcript refresh, NOT a selection. Marked 'background' so
+  // it re-pulls the open chat in place without bumping the user-selection
+  // generation — a click still hydrating must not be cancelled with "Session
+  // open was superseded by a newer selection." just because the 5s roster
+  // poll fired mid-wake.
+  void openBotCanonicalChat(bot, () => generation === getBotOpenGeneration(), {
+    intentSource: 'background'
+  }).catch(() => {
     /* the next click or reclaim event re-resolves it */
   })
 }

@@ -104,16 +104,39 @@ def _midturn_request_pressure_tokens(
     return approx_tokens + (_estimate_tools_tokens_rough(agent.tools) if agent.tools else 0)
 
 
-def _review_input_budget_exhausted(agent: Any) -> bool:
-    """True when a detached review fork has replayed its aggregate input budget.
+def _review_input_budget_exhausted(agent: Any, messages: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """True when a detached review fork has replayed (or is about to cross) its aggregate
+    input budget. Only forks with ``_review_input_token_budget`` are gated (#93057).
 
-    Only forks with an explicit ``_review_input_token_budget`` are gated (#93057). Fires
-    at the top of the NEXT iteration, so the budget-crossing request completes first."""
+    Predictive preflight (STEP 5): stop BEFORE the request that would cross the budget,
+    not after it. The next request's billed input is predicted from the running average
+    billed-input-per-call (self-calibrating; no cache-ratio guesswork — the budget governs
+    BILLED, non-cached input). ``_review_predictive_budget=False`` restores the legacy
+    post-hoc check. ``_review_max_context_tokens`` optionally also caps billed + cache_read
+    (assembled-context pressure)."""
+    used = getattr(agent, "session_input_tokens", 0)
+    if not isinstance(used, int) or isinstance(used, bool):
+        used = 0
+
+    ctx_cap = getattr(agent, "_review_max_context_tokens", 0) or 0
+    if isinstance(ctx_cap, int) and ctx_cap > 0:
+        cache_read = getattr(agent, "session_cache_read_tokens", 0)
+        cache_read = cache_read if isinstance(cache_read, int) and not isinstance(cache_read, bool) else 0
+        if used + cache_read >= ctx_cap:
+            return True
+
     budget = getattr(agent, "_review_input_token_budget", None)
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         return False
-    used = getattr(agent, "session_input_tokens", 0)
-    return isinstance(used, int) and not isinstance(used, bool) and used >= budget
+    if used >= budget:
+        return True
+    if getattr(agent, "_review_predictive_budget", True):
+        calls = getattr(agent, "_api_call_count", 0) or 0
+        if isinstance(calls, int) and calls > 0:
+            predicted_next = (used / calls) * 1.15  # running avg billed input/call + margin
+            if used + predicted_next > budget:
+                return True
+    return False
 
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:

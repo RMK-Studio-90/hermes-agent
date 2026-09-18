@@ -1,0 +1,16 @@
+{
+  "test1": {
+    "mode": "auto",
+    "route": [
+      "omniroute",
+      "cc/claude-opus-4-7"
+    ],
+    "error": "none",
+    "override_why": {
+      "source": "turn",
+      "mode": "strict",
+      "note": "target not eligible for logical_route -> auto"
+    },
+    "ranked": 7
+  }
+}

@@ -210,7 +210,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -419,6 +419,27 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+
+CREATE TABLE IF NOT EXISTS routing_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_index INTEGER NOT NULL,
+    task_requirements TEXT NOT NULL,  -- JSON
+    candidates TEXT NOT NULL,         -- JSON array of objects with model, provider
+    rejection_reasons TEXT NOT NULL,  -- JSON object mapping model:provider to reason
+    selected_provider TEXT NOT NULL,
+    selected_model TEXT NOT NULL,
+    free_paid_route TEXT NOT NULL,    -- 'free' or 'paid'
+    fallback_attempts INTEGER NOT NULL DEFAULT 0,
+    final_model_used TEXT NOT NULL,
+    latency REAL NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    failure_classification TEXT,
+    final_outcome TEXT NOT NULL,
+    timestamp REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -527,6 +548,35 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
+-- One row per completed background memory/skill review fork (agent/background_review.py).
+-- Counters + enums only; NO conversation text, tool payloads, or memory/skill bodies.
+-- The fork runs detached (_session_db=None); this row is written against the PARENT session's
+-- DB at fork completion. Coarser than logs (which stay), finer than session_model_usage
+-- (which has no outcome). Never garbage-collected with the session — soft session_id link.
+CREATE TABLE IF NOT EXISTS background_review_event (
+    event_id           TEXT PRIMARY KEY,
+    ts                 REAL NOT NULL,
+    session_id         TEXT,
+    profile            TEXT,
+    source             TEXT,
+    trigger            TEXT,
+    outcome            TEXT NOT NULL,
+    provider           TEXT,
+    model              TEXT,
+    routed             INTEGER NOT NULL DEFAULT 0,
+    context_strategy   TEXT,
+    provider_calls     INTEGER NOT NULL DEFAULT 0,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    duration_ms        INTEGER NOT NULL DEFAULT 0,
+    wrote_memory       INTEGER NOT NULL DEFAULT 0,
+    wrote_skill        INTEGER NOT NULL DEFAULT 0,
+    reason_code        TEXT,
+    error_code         TEXT,
+    backoff_multiplier INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -547,6 +597,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_bre_session ON background_review_event(session_id);
+CREATE INDEX IF NOT EXISTS idx_bre_ts ON background_review_event(ts);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.

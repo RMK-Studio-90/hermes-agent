@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { GraphProgress } from './graph-progress'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -801,6 +802,12 @@ export function TaskDrawer({
             <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
 
             <EstimateSection id={task.id} />
+
+            {detail.graph && (
+              <Section label="Execution graph">
+                <GraphProgress graph={detail.graph} />
+              </Section>
+            )}
 
             {task.result && (
               <Section label={k.result}>

@@ -553,9 +553,16 @@ def _load_secrets_config(home_path: Path) -> dict:
             return data.get("secrets") or {}
         except Exception:
             pass
+    # Scoped (non-process-home) read: go through read_user_config_raw so this shares its
+    # (resolved path, mtime_ns, size) cache. Under multiplexing every profile-scope entry landed
+    # here and re-parsed a ~100 KB config.yaml — the single largest CPU cost in an idle gateway
+    # profile. Semantics are unchanged: a missing file yields {} and a malformed one still raises
+    # into the except below rather than caching a bad parse. The returned mapping is a deepcopy,
+    # so a consumer mutating it cannot corrupt a later read.
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+        from hermes_cli.config import read_user_config_raw
+
+        data = read_user_config_raw(config_path) or {}
     except Exception:  # noqa: BLE001
         return {}
     return data.get("secrets") or {}

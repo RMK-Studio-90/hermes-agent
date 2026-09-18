@@ -423,10 +423,12 @@ def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
         db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 
-def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_update_version: str | None) -> bool:
+def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_update_version: str | None,
+                          validation_ok: bool = True) -> bool:
     """Final banner. A failed Desktop rebuild is non-fatal but must not print ``✓ Update complete!``.
 
-    See #88251.
+    ``validation_ok=False`` (post-update routing/import gate failed) withholds the completion
+    banner and demotes the verdict to False. See #88251.
     """
     from hermes_cli.update_cmd import _post_update_sqlite_runtime_status, _update_complete_message
     sqlite_runtime_ok, sqlite_info = _post_update_sqlite_runtime_status()
@@ -434,7 +436,7 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
         # Grace path: only a POSITIVE vulnerable probe demotes success to partial.
         sqlite_runtime_ok = True
     print()
-    if node_failures or not desktop_build_ok or not sqlite_runtime_ok:
+    if node_failures or not desktop_build_ok or not sqlite_runtime_ok or not validation_ok:
         parts = []
         if node_failures:
             parts.append(f"Node.js dependencies for {', '.join(node_failures)} did not refresh")
@@ -442,6 +444,8 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
             parts.append("the desktop app was not rebuilt and is still on the previous build")
         if not sqlite_runtime_ok and sqlite_info is not None:
             parts.append(_SQLITE_WAL_BUG_DETAIL.format(sqlite_info.sqlite_version_string))
+        if not validation_ok:
+            parts.append("post-update validation (routing/import) failed — update not accepted")
         print("⚠ Update partially complete — " + "; ".join(parts) + ".")
         if node_failures:
             print("  Code and Python deps are updated, but the dashboard/TUI may")
@@ -457,7 +461,7 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
             )
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
-    return desktop_build_ok and sqlite_runtime_ok
+    return desktop_build_ok and sqlite_runtime_ok and validation_ok
 
 
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
@@ -743,15 +747,41 @@ def _verify_state_db_after_snapshot(snapshot_id: str) -> None:
 
 
 def _run_quick_snapshots() -> Optional[str]:
-    """Quick snapshot of the root home plus every sibling profile; returns the root snapshot id."""
-    from hermes_cli.update_cmd import _record_update_step
+    """Quick snapshot of the root home plus every sibling profile; returns the root snapshot id.
+
+    The root snapshot is a SafeState (state files + ``rmk/`` code/routing layer) so a failed
+    update can roll back to the last verified pre-update state. If the rmk layer cannot be
+    stamped it degrades to the legacy state-only snapshot — the checkpoint is never lost.
+    """
+    from hermes_cli.update_cmd import _m, _record_update_step
     from hermes_cli.backup import create_quick_snapshot
-    snapshot_id = create_quick_snapshot(
-        label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
-    )
-    if snapshot_id:
-        _verify_state_db_after_snapshot(snapshot_id)
-        print(f"◆ Pre-update snapshot: {snapshot_id}")
+    from hermes_cli.rmk_safestate import create_safestate
+    from hermes_constants import get_hermes_home
+
+    snapshot_id = None
+    try:
+        result = create_safestate(
+            label="pre-update", hermes_home=Path(get_hermes_home()),
+            code_root=_m().PROJECT_ROOT,
+            keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        )
+        snapshot_id = result.get("snap_id")
+        if snapshot_id:
+            _verify_state_db_after_snapshot(snapshot_id)
+            if result.get("success"):
+                print(f"◆ Pre-update SafeState: {snapshot_id}")
+            else:
+                print(f"◆ Pre-update snapshot: {snapshot_id} "
+                      f"(rmk layer skipped: {result.get('error', 'unknown error')})")
+    except Exception as exc:
+        logger.debug("SafeState checkpoint failed (%s); falling back to state-only snapshot", exc)
+    if not snapshot_id:
+        snapshot_id = create_quick_snapshot(
+            label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        )
+        if snapshot_id:
+            _verify_state_db_after_snapshot(snapshot_id)
+            print(f"◆ Pre-update snapshot: {snapshot_id}")
 
     # The code swap + fleet restart touch EVERY profile, so each gets the same snapshot
     # under its own state-snapshots/. Best-effort per profile.
@@ -969,6 +999,226 @@ def _print_post_update_notices_and_self_heals() -> None:
             step()
 
 
+# --- Phase 6 update-safety: post-pull validation & rollback -------------------
+#
+# The pulled tree must boot offline before any post-update mutation. Structure is gated on a
+# subprocess routing probe (mirrors ``_critical_module_import_failures`` in update_cmd_deps.py);
+# "Hermes doctor" is REPORT-ONLY — its live connectivity / npm-audit rows must never veto a
+# structurally sound update, so the static-only probe excludes them. On gate failure the update
+# rolls back to the last VERIFIED pre-update SafeState and is never accepted.
+
+_ROUTING_IMPORT_CHAIN = ("agent.routing.registry", "agent.routing.router", "agent.routing.logical")
+_ROUTING_PROBE_TIMEOUT = 180
+_DOCTOR_PROBE_TIMEOUT = 180
+# Doctor rows that must NOT run inside an update: npm audit (slow) and API connectivity (real
+# HTTP/SDK probes against every configured provider). Structural gates — this routing probe plus
+# the syntax / critical-import / state.db checks — already cover boot.
+_DOCTOR_SKIPPED_CHECKS = ("_check_npm_audit", "_check_api_connectivity")
+
+
+def _routing_probe_failures(root, home) -> dict:
+    """Import the offline routing chain and parse the live routing registry in a subprocess.
+
+    Returns ``{module: (kind, detail)}`` for routing modules that fail to import, or a single
+    ``routing/registry.json`` row when the live registry is unreadable or lacks the ``models``
+    key. The venv interpreter mirrors the update's own runtime so import side effects stay out
+    of our ``sys.modules`` (same probe scheme as ``_critical_module_import_failures``). A
+    missing *third-party* package is a deps problem (warned elsewhere, never a gate); only the
+    chain's own first-party packages and ``agent`` count. Returns ``{}`` when the probe itself
+    cannot start — we never block the update on our own tooling.
+    """
+    from hermes_cli.update_cmd import _m
+    from hermes_constants import FIRST_PARTY_MODULE_ROOTS
+    import json
+    import secrets
+    marker = f"__HERMES_ROUTING_HEALTH_{secrets.token_hex(16)}__"
+    registry_path = Path(home) / "routing" / "registry.json"
+    probe = (
+        "import importlib, json, sys\n"
+        "failures = []\n"
+        "for name in %r:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as exc:\n"
+        "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
+        "        if missing in %r or missing.startswith('hermes_') or missing in ('agent',):\n"
+        "            failures.append((name, type(exc).__name__, str(exc)))\n"
+        "    except ImportError as exc:\n"
+        "        failures.append((name, type(exc).__name__, str(exc)))\n"
+        "    except BaseException as exc:\n"
+        "        failures.append((name, type(exc).__name__, str(exc)))\n"
+        "try:\n"
+        "    with open(%r, 'r', encoding='utf-8') as fh:\n"
+        "        reg = json.load(fh)\n"
+        "    if not isinstance(reg, dict) or 'models' not in reg:\n"
+        "        failures.append(('routing/registry.json', 'RegistryInvalid', 'missing models key'))\n"
+        "except Exception as exc:\n"
+        "    failures.append(('routing/registry.json', 'RegistryUnreadable', str(exc)))\n"
+        "sys.stdout.write('\\n%s' + json.dumps(failures))\n"
+        % (_ROUTING_IMPORT_CHAIN, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)), str(registry_path), marker)
+    )
+    try:
+        interpreter = sys.executable
+        with suppress(Exception):
+            venv_python = venv_python_path(Path(root) / "venv", windows=_m()._is_windows())
+            if venv_python.exists():
+                interpreter = str(venv_python)
+        result = subprocess.run(
+            [interpreter, "-c", probe], cwd=str(root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_ROUTING_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"routing-probe": ("TimeoutExpired", "timed out before reporting routing health")}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    output = result.stdout or ""
+    if marker not in output:
+        return {"routing-probe": ("ProbeTerminated",
+                f"terminated before reporting routing health (exit code {result.returncode})")}
+    try:
+        failures = json.loads(output.rsplit(marker, 1)[1])
+        if not isinstance(failures, list) or any(
+            not isinstance(item, list) or len(item) != 3 or not all(isinstance(v, str) for v in item)
+            for item in failures):
+            raise ValueError("invalid routing-health payload")
+        return {str(module): (str(kind), str(detail)) for module, kind, detail in failures}
+    except (TypeError, ValueError):
+        return {"routing-probe": ("MalformedPayload", "reported malformed routing health data")}
+
+
+def _run_doctor_probe(root=None) -> dict:
+    """Bounded, REPORT-ONLY doctor run in a subprocess with the network rows excluded.
+
+    Runs the real ``DOCTOR_CHECKS`` minus ``_DOCTOR_SKIPPED_CHECKS`` (npm audit and live provider
+    probes must never veto or hang an update). Returns ``{"status": "ok"}`` when it completes,
+    ``{"status": "failed", "detail": ...}`` when ``run_doctor`` raises, and ``{}`` when the probe
+    itself cannot start (never gates on our own tooling).
+    """
+    from hermes_cli.update_cmd import _m
+    import secrets
+    marker = f"__HERMES_DOCTOR_PROBE_{secrets.token_hex(16)}__"
+    skipped = ", ".join(repr(name) for name in _DOCTOR_SKIPPED_CHECKS)
+    probe = (
+        "import argparse, sys\n"
+        "from hermes_cli import doctor\n"
+        "doctor.DOCTOR_CHECKS = tuple((t, c) for t, c in doctor.DOCTOR_CHECKS\n"
+        "                              if c.__name__ not in (%s,))\n"
+        "try:\n"
+        "    doctor.run_doctor(argparse.Namespace(fix=False, ack=None, live=False))\n"
+        "    sys.stdout.write('\\n%s' + 'OK')\n"
+        "except BaseException as exc:\n"
+        "    sys.stdout.write('\\n%s' + type(exc).__name__ + ': ' + str(exc))\n"
+        % (skipped, marker, marker)
+    )
+    if root is None:
+        root = _m().PROJECT_ROOT
+    try:
+        interpreter = sys.executable
+        with suppress(Exception):
+            venv_python = venv_python_path(Path(root) / "venv", windows=_m()._is_windows())
+            if venv_python.exists():
+                interpreter = str(venv_python)
+        result = subprocess.run(
+            [interpreter, "-c", probe], cwd=str(root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_DOCTOR_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "detail": "timed out"}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    output = result.stdout or ""
+    if marker not in output:
+        return {"status": "failed", "detail": f"no report (exit {result.returncode})"}
+    payload = output.rsplit(marker, 1)[-1].strip()
+    if payload == "OK":
+        return {"status": "ok"}
+    if payload:
+        return {"status": "failed", "detail": payload[:300]}
+    return {"status": "failed", "detail": "empty doctor report"}
+
+
+def _run_post_update_validation(pre_update_snapshot_id, root=None, home=None) -> dict:
+    """Phase 6 gate: prove the pulled tree boots BEFORE any post-update mutation.
+
+    ``checks`` holds ``{"name", "ok", "report_only", "detail"}`` rows; ``ok`` is False iff a
+    NON-report-only check fails. routing_probe GATES; the doctor report is skipped when routing
+    already fails — a dead routing layer needs rollback, not diagnostics.
+    """
+    if root is None or home is None:
+        from hermes_cli.update_cmd import _m
+        from hermes_constants import get_hermes_home
+        root = root or _m().PROJECT_ROOT
+        home = home or get_hermes_home()
+    checks = []
+
+    routing_failures = _routing_probe_failures(root, home)
+    checks.append({
+        "name": "routing_probe",
+        "ok": not routing_failures,
+        "report_only": False,
+        "detail": ("; ".join(f"{m} → {k}: {d}" for m, (k, d) in routing_failures.items())
+                   or "offline routing chain imports and live registry valid"),
+    })
+    if routing_failures:
+        return {"ok": False, "checks": checks, "pre_update_snapshot_id": pre_update_snapshot_id}
+
+    doctor = _run_doctor_probe(root)
+    checks.append({
+        "name": "doctor_probe",
+        "ok": doctor.get("status") == "ok",
+        "report_only": True,
+        "detail": doctor.get("detail", "doctor completed"),
+    })
+    return {"ok": True, "checks": checks, "pre_update_snapshot_id": pre_update_snapshot_id}
+
+
+def _rollback_after_failed_validation(pre_update_snapshot_id, validation, root=None, home=None) -> bool:
+    """Roll back a validation-failed update to the last VERIFIED pre-update SafeState.
+
+    Verify FIRST (rmk integrity + state files + code patch — NOT the routing registry: live
+    routing drift is expected post-update). Only a verified SafeState may write code (live-git
+    restore). Returns False in every path — the update is never accepted.
+    """
+    print("⚠ Post-update validation FAILED — the update will NOT be accepted.")
+    for check in validation.get("checks", []):
+        if not check.get("ok") and not check.get("report_only"):
+            print(f"  ✗ {check.get('name')}: {check.get('detail', 'failed')}")
+    if not pre_update_snapshot_id:
+        print("  ✗ No pre-update SafeState exists — cannot roll back automatically.")
+        print("    Manual recovery: run `hermes update` again (it takes a fresh checkpoint),")
+        print("    or create/restore a snapshot with `hermes rmk-safestate`.")
+        return False
+    if root is None or home is None:
+        from hermes_cli.update_cmd import _m
+        from hermes_constants import get_hermes_home
+        root = root or _m().PROJECT_ROOT
+        home = home or get_hermes_home()
+    from hermes_cli.rmk_safestate import restore_safestate, verify_safestate
+    vres = verify_safestate(
+        pre_update_snapshot_id, hermes_home=home, code_root=root, include_routing_check=False)
+    if not vres.get("success"):
+        bad = ", ".join(c.get("name", "?") for c in vres.get("checks", []) if not c.get("ok"))
+        print(f"  ✗ Pre-update SafeState {pre_update_snapshot_id} did NOT verify — "
+              f"refusing to restore: {bad or vres.get('error', 'unknown error')}")
+        return False
+    print(f"  ✓ Pre-update SafeState {pre_update_snapshot_id} verified — restoring.")
+    rres = restore_safestate(
+        pre_update_snapshot_id, hermes_home=home, code_root=root,
+        state_mode="live", code_mode="live-git")
+    code_result = rres.get("code_result", {})
+    state_result = rres.get("state_result", {})
+    if code_result.get("mode") == "live-git" and code_result.get("success"):
+        print(f"  ✓ Code rolled back: {code_result.get('detail', 'ok')}")
+    else:
+        reason = code_result.get("detail") or code_result.get("error") or rres.get("error") or "unknown"
+        print(f"  ✗ Code rollback did NOT complete: {reason}")
+        print("    The update was never accepted; restore code manually from the SafeState.")
+    if state_result.get("mode") == "live" and state_result.get("success"):
+        print("  ✓ State restored to the last verified pre-update SafeState.")
+    else:
+        print(f"  ✗ State restore was not applied: {state_result.get('error') or 'skipped'}")
+        print("    Run `hermes rmk-safestate` to restore state manually.")
+    return False
+
+
 def _run_post_update_maintenance(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update, node_failures, desktop_build_ok,
     pre_update_version,
@@ -977,6 +1227,14 @@ def _run_post_update_maintenance(
     the update summary (verdict returned), and best-effort notices/self-heals. Every step is
     isolated so none can fail the update."""
     from hermes_cli.update_cmd import _check_and_apply_config_migration, _m
+
+    # Phase 6 gate: the pulled tree must boot (offline routing probe) BEFORE any post-update
+    # mutation (config migration, state restore). A tree that fails probing is rolled back to
+    # the last verified pre-update SafeState and is NOT accepted — no blind "Update complete!".
+    validation = _run_post_update_validation(pre_update_snapshot_id)
+    if not validation["ok"]:
+        return _rollback_after_failed_validation(pre_update_snapshot_id, validation)
+
     # macOS TCC: Desktop bundles are re-signed each update, so old grants can go stale
     # (toggle ON, yet macOS re-prompts with no Allow button). Tell users how to re-grant.
     # With the post-#73681 identifier-pinned DR, new grants survive rebuilds — but a grant made to a pre-fix
@@ -1024,6 +1282,7 @@ def _run_post_update_maintenance(
 
     update_complete = _print_update_summary(
         node_failures=node_failures, desktop_build_ok=desktop_build_ok, pre_update_version=pre_update_version,
+        validation_ok=validation["ok"],
     )
 
     _print_post_update_notices_and_self_heals()

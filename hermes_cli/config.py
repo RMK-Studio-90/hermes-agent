@@ -186,6 +186,12 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
 # path -> (mtime_ns, size, raw yaml dict) for read_raw_config() (no defaults merged in).
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# resolved path -> (mtime_ns, size, raw yaml dict) for read_user_config_raw(). Separate from
+# _RAW_CONFIG_CACHE because that one is keyed to the ACTIVE profile's config only, while this
+# function is handed an arbitrary profile's file (multiplexing, `hermes profile list`, cron).
+# Keyed on the RESOLVED path so two profiles can never share an entry and a symlinked home
+# correctly shares one. Bounded by the number of distinct config.yaml files on the box.
+_USER_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1893,17 +1899,52 @@ def read_raw_config() -> Dict[str, Any]:
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Read a user ``config.yaml`` EXACTLY as written (no defaults/overlay/expansion, no cache).
+    """Read a user ``config.yaml`` EXACTLY as written (no defaults/overlay/expansion).
     ONLY legal for write-back round-trips and raw-file diagnostics — behavioral reads must use
-    load_config()/load_config_readonly()."""
+    load_config()/load_config_readonly().
+
+    Cached on (resolved path, mtime_ns, size) and returns a DEEPCOPY, mirroring
+    ``read_raw_config()``: several callers mutate the result and hand it to ``save_config()`` /
+    ``atomic_config_write()``, so a shared object would let one writer corrupt the next reader.
+    Under profile multiplexing this is called ~2/s per process against a ~100 KB config.yaml
+    (``profiles.list_profiles`` -> ``_profile_info``), which showed up as the dominant CPU cost
+    in an idle-gateway profile; an unchanged file must not be re-parsed for that.
+    A parse failure still propagates and never populates the cache.
+    """
     if config_path is None:
         config_path = get_config_path()
+
+    path_key: Optional[str] = None
+    cache_key: Optional[Tuple[int, int]] = None
+    try:
+        st = os.stat(config_path)
+        path_key = str(Path(config_path).resolve())
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        # Unstattable but possibly readable (odd mounts): fall through uncached.
+        path_key = cache_key = None
+
+    if path_key is not None:
+        with _CONFIG_LOCK:
+            cached = _USER_CONFIG_CACHE.get(path_key)
+            if cached is not None and cached[:2] == cache_key:
+                return copy.deepcopy(cached[2])
+
     try:
         with open(config_path, encoding="utf-8") as f:
             data = fast_safe_load(f) or {}
     except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    if path_key is not None and cache_key is not None:
+        # The cache keeps its OWN copy; the caller gets the fresh parse and may mutate it freely.
+        with _CONFIG_LOCK:
+            _USER_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
+    return data
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:

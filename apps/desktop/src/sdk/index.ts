@@ -348,6 +348,23 @@ export interface PluginOpenSessionOptions {
   forceResume?: boolean
   hydrationTimeoutMs?: number
   intent?: OpenSessionIntent
+  /** Who initiated this open.
+   *
+   *  'user' (default) is a person picking a session — a roster click, a
+   *  session-list click, New Agent. It advances the monotonic
+   *  openSessionGeneration, so any open still hydrating is superseded: the
+   *  user has moved on.
+   *
+   *  'background' is a self-initiated refresh that is NOT a new selection —
+   *  the 5s roster poll re-pulling the open chat's transcript, a
+   *  `session.reclaimed` mass-reap re-resume, a tile resync. A background
+   *  open SNAPSHOTS the generation instead of bumping it, so it can never
+   *  cancel a user's in-flight click ("Session open was superseded by a
+   *  newer selection." during ordinary navigation — the shared root cause).
+   *  It is itself superseded the moment a real 'user' open starts, and still
+   *  fails closed on a target it no longer owns (the workspace-owner check in
+   *  openingStillCurrent), so stale background responses are still rejected. */
+  intentSource?: 'background' | 'user'
   keepAllProfilesScope?: boolean
   profile?: null | string
   route?: PluginProfileRoute
@@ -847,11 +864,23 @@ export const host = {
    *  and would otherwise look like every session disappeared. Pass false to
    *  also scope chrome onto that profile and collapse the sidebar. */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
-    const generation = ++openSessionGeneration
+    // A 'user' open advances the selection generation; a 'background' refresh
+    // only SNAPSHOTS it. openingStillCurrent / the hydration wait read
+    // "generation === openSessionGeneration" as "no newer USER open has
+    // started" — always true for a background refresh that races nothing,
+    // false the instant a real click lands. This is what stops the 5s roster
+    // poll (and session.reclaimed re-resume) from cancelling a bot click
+    // mid-wake with "Session open was superseded by a newer selection."
+    const isBackgroundOpen = options.intentSource === 'background'
+    const generation = isBackgroundOpen ? openSessionGeneration : ++openSessionGeneration
 
     // A new wake owns the syncing affordance — a lingering badge from an
-    // earlier paint-first wake must not survive into this one.
-    $hydrationSyncProfile.set(null)
+    // earlier paint-first wake must not survive into this one. A background
+    // refresh is not a new wake and must never clear a user open's badge.
+    if (!isBackgroundOpen) {
+      $hydrationSyncProfile.set(null)
+    }
+
     const explicitRoute = options.route ? { ...options.route } : null
     const profile = (explicitRoute?.profile ?? options.profile ?? '').trim()
     const targetProfile = normalizeProfileKey(profile || $activeGatewayProfile.get())
@@ -980,9 +1009,11 @@ export const host = {
         throw new Error('Session open was superseded by a newer selection.')
       }
 
-      if (options.awaitHydration) {
+      if (options.awaitHydration && !isBackgroundOpen) {
         // Keep the target-specific overlay visible through transcript hydration,
         // not merely through the gateway/profile activation that precedes it.
+        // A background refresh must not raise (or later tear down) the
+        // "Waking up …" swap overlay a user open owns.
         $gatewaySwapTarget.set(targetProfile)
       }
 
@@ -1102,10 +1133,15 @@ export const host = {
     } catch (error) {
       if (
         options.awaitHydration &&
+        !isBackgroundOpen &&
         openingStillCurrent() &&
         error instanceof Error &&
         error.message.startsWith('Timed out loading ')
       ) {
+        // A background refresh (roster poll, reclaim re-resume) that times out
+        // must NOT arm the core stranded-session Retry overlay: the session on
+        // screen is fine, only the background re-pull was slow. Only a user's
+        // own wake earns that surface.
         const timedOutAt = Date.now()
 
         console.warn('[bot-wake] hydration timed out', {
@@ -1126,7 +1162,7 @@ export const host = {
 
       throw error
     } finally {
-      if (options.awaitHydration && generation === openSessionGeneration) {
+      if (options.awaitHydration && !isBackgroundOpen && generation === openSessionGeneration) {
         $gatewaySwapTarget.set(null)
       }
     }

@@ -179,6 +179,52 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
             row["total_models"] = len(filtered)
 
 
+ROUTING_PROFILE_ROW_SLUG = "routing"
+_ROUTING_PROFILES = [
+    {"slug": "rmk-smart", "name": "RMK Smart Routing", "description": "Auto-select best model per task"},
+    {"slug": "rmk-fast", "name": "RMK Fast", "description": "Optimized for low latency"},
+    {"slug": "rmk-code", "name": "RMK Code", "description": "Best for coding tasks (tools+structured)"},
+    {"slug": "rmk-reason", "name": "RMK Reasoning", "description": "Best for reasoning tasks"},
+    {"slug": "rmk-general", "name": "RMK General", "description": "Balanced general-purpose routing"},
+    {"slug": "rmk-research", "name": "RMK Research", "description": "Optimized for research tasks (long context)"},
+    {"slug": "rmk-vision", "name": "RMK Vision", "description": "Best for vision tasks"},
+]
+
+
+def _current_routing_profile(config=None) -> str:
+    """The routing profile governing the picker (explicit routing.profile, or
+    the rmk-smart default when adaptive routing is enabled; '' when legacy)."""
+    from agent.routing.profile import effective_routing_profile
+    try:
+        return effective_routing_profile(config) if config is not None else effective_routing_profile()
+    except Exception:
+        return ""
+
+
+def _build_routing_profile_row(current_routing: str) -> dict:
+    """Build the AUTO / ROUTING virtual provider row for the model picker."""
+    from agent.routing.profile import DEFAULT_ROUTING_PROFILE
+    models = [p["slug"] for p in _ROUTING_PROFILES]
+    descriptions = {p["slug"]: p["name"] for p in _ROUTING_PROFILES}
+    return {
+        "slug": ROUTING_PROFILE_ROW_SLUG,
+        "name": "AUTO / ROUTING",
+        "is_current": bool(current_routing),
+        "is_user_defined": False,
+        "authenticated": True,
+        "auth_type": "routing",
+        "source": "virtual",
+        "total_models": len(models),
+        "models": models,
+        "featured_models": models,
+        "capabilities": {},
+        # Friendly labels + the default marker so the dropdown can render the
+        # routing section without hardcoding slugs.
+        "model_labels": {p["slug"]: (p["description"] or p["name"]) for p in _ROUTING_PROFILES},
+        "default_profile": DEFAULT_ROUTING_PROFILE,
+    }
+
+
 def build_model_options_payload(
     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
     refresh: bool = False,
@@ -192,6 +238,24 @@ def build_model_options_payload(
         capabilities=True, featured=True,
         refresh=refresh, probe_custom_providers=refresh, probe_current_custom_provider=not refresh,
     )
+
+    # Inject the routing profile row at the top of providers.
+    # Routing is always available as a first-class selection (adaptive routing
+    # with the RMK registry).  Mark the currently-active profile so the
+    # dropdown checkmark lands on the right row.
+    try:
+        current_routing = _current_routing_profile()
+        row = _build_routing_profile_row(current_routing)
+        # Mark the active profile
+        if current_routing:
+            row["active_profile"] = current_routing
+        payload["providers"] = [row] + payload.get("providers", [])
+        # Expose at the payload level so the frontend can identify routing state
+        payload["routing_profile"] = current_routing or None
+    except Exception:
+        # Non-fatal: routing row is decorative; never break the picker.
+        pass
+
     if not refresh:
         _prewarm_pricing_async(payload["providers"], current_provider=ctx.current_provider,
                                current_base_url=ctx.current_base_url)

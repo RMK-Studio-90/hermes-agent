@@ -323,7 +323,8 @@ def _mirror_stop(sid, session, agent, arg) -> None:
 # name → mirror(sid, session, agent, arg); a falsy return means "no warning".
 _SLASH_MIRRORS = {
     "model": lambda sid, session, agent, arg: (
-        _apply_model_switch(sid, session, arg).get("warning", "") if arg and agent else ""),
+        _apply_model_switch(sid, session, arg, manual_selection=True).get("warning", "")
+        if arg and agent else ""),
     "approvals": _mirror_approvals, "personality": _mirror_personality, "prompt": _mirror_prompt,
     "compress": lambda sid, session, agent, arg: (
         _compress_live_with_feedback(sid, session, agent, arg, snapshot_kwargs=False) if agent else ""),

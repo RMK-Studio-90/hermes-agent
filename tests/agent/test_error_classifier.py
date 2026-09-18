@@ -72,6 +72,9 @@ class TestFailoverReason:
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
             "unknown",
+            # P1-1: routing-candidate admission — provider connection/endpoint
+            # could not be resolved (agent/routing/integration.py).
+            "connection_unresolved",
         }
         actual = {r.value for r in FailoverReason}
         assert expected == actual
@@ -464,6 +467,43 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    @pytest.mark.parametrize("msg", [
+        "Service temporarily unavailable",
+        "service is unavailable, try later",
+        "Provider temporarily unavailable",
+        "Bad gateway",
+        "The upstream provider is unavailable",
+        "gateway unavailable",
+        "Endpoint is unavailable",
+        "not available at the moment",
+    ])
+    def test_statusless_provider_outage_is_overloaded(self, msg):
+        """A proxy/SSE frame that strips the HTTP status still leaves the
+        canonical 503 wording ('Service Unavailable', 'bad gateway', ...).
+        These MUST classify as overloaded (transient back-off -> degrade ->
+        fail over), never unknown (retry-only, no fallback) and never rotate
+        the credential. Mandate failure class: temporary provider unavailable."""
+        e = MockAPIError(msg)  # no status_code
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+
+    @pytest.mark.parametrize("msg,expected", [
+        # Model-scoped availability is NOT a provider outage — stays distinct.
+        ("the model is unavailable", FailoverReason.unknown),
+        ("model not available on the free tier", FailoverReason.billing),
+        ("model not found", FailoverReason.model_not_found),
+    ])
+    def test_outage_patterns_do_not_capture_model_scoped_wording(self, msg, expected):
+        """The provider-outage pattern set must stay narrow: wordings that name
+        the *model* ('not found', 'not on the free tier', bare 'the model is
+        unavailable') are a different failure class and must not be swallowed
+        into overloaded."""
+        e = MockAPIError(msg)  # no status_code
+        result = classify_api_error(e)
+        assert result.reason == expected
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server
@@ -510,13 +550,15 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.overloaded
         assert result.retryable is True
         assert result.should_rotate_credential is False
+        assert result.should_fallback is True  # P0: defer to a healthy route
 
     def test_429_server_overload_is_overloaded_not_rate_limit(self):
         """Novita returns HTTP 429 with message 'server overload, please try
         again later' and error type 'server_overload' for a genuinely busy
-        server (not a credential quota). Neither phrase was in the overload
-        tuple, so it fell through to rate_limit and would rotate the credential
-        / fall back early instead of retrying the same key. (#106205)"""
+        server (not a credential quota). It must stay overloaded, NOT rotate
+        the credential (the key is healthy) — but must mark should_fallback so
+        the retry loop fails over to a healthy route instead of beating the
+        dead server. (#106205, P0 overload failover)"""
         e = MockAPIError(
             "server overload, please try again later",
             status_code=429,
@@ -526,7 +568,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="custom:novita")
         assert result.reason == FailoverReason.overloaded
         assert result.retryable is True
-        assert result.should_fallback is False
+        assert result.should_fallback is True
         assert result.should_rotate_credential is False
 
     def test_429_normal_rate_limit_still_rotates(self):

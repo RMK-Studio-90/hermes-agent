@@ -20,12 +20,18 @@ from hermes_cli.main import cmd_update
 @pytest.fixture(autouse=True)
 def _isolate_update(isolated_update_runtime, monkeypatch):
     import shutil
-    from hermes_cli import managed_uv, update_cmd
+    from hermes_cli import managed_uv, update_cmd, update_cmd_maint
 
     monkeypatch.setattr(managed_uv, "resolve_uv", lambda **kw: shutil.which("uv"))
     monkeypatch.setattr(managed_uv, "ensure_uv", lambda **kw: shutil.which("uv"))
     monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **kw: None)
     monkeypatch.setattr(update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None))
+    # Phase 6 gate: these tests exercise the --yes TTY semantics, not the routing/doctor
+    # probes. These tests mock subprocess.run globally, which makes the real routing-probe
+    # subprocess come back empty (ProbeTerminated) and abort the update before the config
+    # migration ever runs. Stub the probes healthy so a clean update reaches migration.
+    monkeypatch.setattr(update_cmd_maint, "_routing_probe_failures", lambda root, home: {})
+    monkeypatch.setattr(update_cmd_maint, "_run_doctor_probe", lambda root: {"status": "ok"})
 
 
 def _make_run_side_effect(

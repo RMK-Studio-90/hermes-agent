@@ -509,6 +509,13 @@ export interface ModelOptionProvider {
   /** Per-model option support, keyed by model id (present when the picker
    *  requested capabilities). Lets the UI gate fast/reasoning controls. */
   capabilities?: Record<string, ModelCapabilities>
+  /** The AUTO / ROUTING virtual provider only: friendly labels for each
+   *  routing profile slug (rmk-smart -> "Auto-select best model per task"). */
+  model_labels?: Record<string, string>
+  /** The AUTO / ROUTING virtual provider only: the default routing profile
+   *  slug (what routing behaves as when adaptive routing is on and nothing
+   *  was explicitly chosen). */
+  default_profile?: string
 }
 
 export interface ModelCapabilities {
@@ -524,6 +531,10 @@ export interface ModelOptionsResponse {
   model?: string
   provider?: string
   providers?: ModelOptionProvider[]
+  /** Active RMK routing profile slug (e.g. "rmk-smart"), or null/absent when
+   *  the legacy pinned-model mode governs. Reported by the backend so the
+   *  dropdown's AUTO / ROUTING section can mark the current entry. */
+  routing_profile?: null | string
 }
 
 export interface PaginatedSessions {

@@ -573,7 +573,10 @@ export default {
               }
 
               const generation = getBotOpenGeneration()
-              void openBotCanonicalChat(bot)
+              // Proactive reclaim re-resume, NOT a selection: 'background' so a
+              // mass-reap (which fires this for every open bot chat at once)
+              // cannot supersede a user's in-flight bot click.
+              void openBotCanonicalChat(bot, null, { intentSource: 'background' })
                 .then(opened => {
                   // A user action while the re-resume ran owns the center now.
                   if (!opened || generation !== getBotOpenGeneration()) {

@@ -351,6 +351,8 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
+        from agent.graph.kanban import board_graph
+        graph_progress = board_graph(conn, task_id)
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
@@ -358,6 +360,7 @@ def get_task(
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
         return {
             "task": task_d,
+            "graph": graph_progress,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],

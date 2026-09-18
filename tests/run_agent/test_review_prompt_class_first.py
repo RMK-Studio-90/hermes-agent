@@ -1,7 +1,8 @@
 """Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
+The review prompts steer the background review agent toward CONSERVATIVE,
+evidence-based skill updates: most sessions produce no durable change, and an
+unjustified edit is worse than none. When an update IS warranted, the bias is:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
@@ -21,15 +22,19 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_biases_toward_conservative_updates():
+    """Prompt must frame 'Nothing to save.' as the common, correct outcome and require
+    reusable evidence before any edit (production yield was ~1 skill write / 141 reviews)."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
+    lower = prompt.lower()
+    assert "reusable" in lower, "must require reusable evidence, not one-off narratives"
+    assert "nothing to save" in lower, "must offer the no-op outcome explicitly"
+    # Must NOT frame inaction as a failure / missed opportunity (the overturned stance).
+    assert "missed learning opportunity" not in lower, (
+        "must not frame a no-op review as a miss"
     )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
+    assert "worse than none" in lower or "unjustified" in lower, (
+        "must warn that an unjustified edit is worse than no edit"
     )
 
 

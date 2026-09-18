@@ -129,7 +129,8 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
-                    result = run_conversation(
+                    from agent.graph.turn import run_conversation as graph_turn
+                    result = graph_turn(run_conversation,
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,

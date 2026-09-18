@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -383,6 +384,83 @@ class SessionUsageMixin:
         # FK to sessions.id: same INSERT OR IGNORE guard as update_token_counts.
         self._insert_session_row(session_id, "unknown")
         self._execute_write(lambda conn: self._record_model_usage(conn, session_id, task=task, **usage))
+
+    def record_routing_telemetry(
+        self, session_id: str, *, turn_index: int, task_requirements: Dict[str, Any],
+        candidates: List[Dict[str, Any]], rejection_reasons: Dict[str, Any],
+        selected_provider: str, selected_model: str, free_paid_route: str,
+        fallback_attempts: int, final_model_used: str, latency: float,
+        input_tokens: int = 0, output_tokens: int = 0,
+        failure_classification: Optional[str] = None, final_outcome: str = "success",
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Persist the final route actually used for one adaptive-routing turn.
+
+        This narrow state-store API is called after provider outcome is known, so
+        ``final_model_used`` cannot describe merely a proposed candidate.
+        """
+        if not session_id:
+            return
+        self._insert_session_row(session_id, "unknown")
+        values = (
+            session_id, int(turn_index), json.dumps(task_requirements or {}, sort_keys=True),
+            json.dumps(candidates or [], sort_keys=True), json.dumps(rejection_reasons or {}, sort_keys=True),
+            str(selected_provider or ""), str(selected_model or ""), str(free_paid_route or "unknown"),
+            max(0, int(fallback_attempts)), str(final_model_used or ""), float(latency or 0.0),
+            int(input_tokens or 0), int(output_tokens or 0), failure_classification,
+            str(final_outcome or "unknown"), float(timestamp if timestamp is not None else time.time()),
+        )
+        self._execute_write(lambda conn: conn.execute(
+            """INSERT INTO routing_telemetry (
+                session_id, turn_index, task_requirements, candidates, rejection_reasons,
+                selected_provider, selected_model, free_paid_route, fallback_attempts,
+                final_model_used, latency, input_tokens, output_tokens,
+                failure_classification, final_outcome, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
+        ))
+
+    def routing_telemetry_recent(self, session_id: Optional[str] = None, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Read recent persisted routing rows for dashboards and diagnostics."""
+        limit = max(1, min(int(limit), 1000))
+        where = "WHERE session_id = ?" if session_id else ""
+        params = (session_id, limit) if session_id else (limit,)
+        rows = self._read_all(
+            f"SELECT * FROM routing_telemetry {where} ORDER BY timestamp DESC, id DESC LIMIT ?", params,
+        )
+        return [dict(row) for row in rows]
+
+    _BRE_COLUMNS = (
+        "event_id", "ts", "session_id", "profile", "source", "trigger", "outcome",
+        "provider", "model", "routed", "context_strategy", "provider_calls",
+        "input_tokens", "output_tokens", "cache_read_tokens", "duration_ms",
+        "wrote_memory", "wrote_skill", "reason_code", "error_code", "backoff_multiplier",
+    )
+
+    def record_background_review_event(self, **fields: Any) -> None:
+        """Insert one ``background_review_event`` row (per completed review fork).
+
+        Counters + enums only — the caller must NOT pass conversation text, tool payloads
+        or memory/skill bodies. ``event_id`` and ``outcome`` are required; everything else
+        defaults. Best-effort: never raises into the review thread. The fork itself has
+        ``_session_db=None``; this is called on the PARENT session's DB.
+        """
+        try:
+            if not fields.get("event_id") or not fields.get("outcome"):
+                return
+            fields.setdefault("ts", time.time())
+            row = {c: fields.get(c) for c in self._BRE_COLUMNS}
+            for c in ("routed", "provider_calls", "input_tokens", "output_tokens",
+                      "cache_read_tokens", "duration_ms", "wrote_memory", "wrote_skill"):
+                row[c] = int(row[c] or 0)
+            row["backoff_multiplier"] = int(row.get("backoff_multiplier") or 1)
+            cols = ", ".join(self._BRE_COLUMNS)
+            ph = ", ".join("?" for _ in self._BRE_COLUMNS)
+            self._execute_write(lambda conn: conn.execute(
+                f"INSERT OR REPLACE INTO background_review_event ({cols}) VALUES ({ph})",
+                tuple(row[c] for c in self._BRE_COLUMNS),
+            ))
+        except Exception as e:  # noqa: BLE001 — telemetry must never break a review
+            logger.debug("record_background_review_event failed (non-fatal): %s", e)
 
     def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
         """Tokens and spend across the whole store (one scan), so the sidebar total does not

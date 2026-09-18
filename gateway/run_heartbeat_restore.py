@@ -14,13 +14,19 @@ async def restore_heartbeat_watches(runner) -> None:
     Run all storage work off-loop so a cold profile DB cannot block adapters.
     """
     from gateway.run import _profile_runtime_scope
-    from hermes_cli.heartbeat import HeartbeatManager
+    from hermes_cli.heartbeat import active_heartbeat_session_ids
     from hermes_constants import get_hermes_home
 
     store = runner.session_store
 
     def scan():
         restored = []
+        # One ACTIVE-heartbeat set per profile DB, not one SELECT per session. The poller runs
+        # every POLL_SECONDS over every known session, so the old per-session load_heartbeat()
+        # was O(sessions) x poll rate against state_meta (331 sessions -> ~4k SELECTs/min at
+        # idle). The set is memoised on the resolved HERMES_HOME — the exact key goals._DB_CACHE
+        # uses — so multiplexed profiles still each read their OWN DB, just once per scan.
+        active_by_home = {}
         # The poller may have been spawned by a named profile's /heartbeat command.
         # Anchor even default origins to the gateway home, not inherited context.
         home = getattr(store, "_routing_home", None) or get_hermes_home()
@@ -31,8 +37,11 @@ async def restore_heartbeat_watches(runner) -> None:
                     continue
                 try:
                     with runner._profile_scope_for_source(entry.origin):
-                        manager = HeartbeatManager(entry.session_id)
-                        if manager.is_active():
+                        scope_home = str(get_hermes_home())
+                        active = active_by_home.get(scope_home)
+                        if active is None:
+                            active = active_by_home[scope_home] = active_heartbeat_session_ids()
+                        if entry.session_id in active:
                             restored.append((entry.session_key, entry.origin, entry.session_id))
                 except Exception:
                     logger.debug("heartbeat restore for %s failed", entry.session_key, exc_info=True)

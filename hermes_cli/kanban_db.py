@@ -993,7 +993,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- BUILD-01: additive telemetry columns (nullable; NULL on historical rows)
+    latency_ms          INTEGER,
+    config_version      TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1044,6 +1047,123 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+-- BUILD-02 (Evaluation Event + Reflection Record stores)
+-- Canonical source: K09 §6.2 (BUILD-02), K05 §6.2/§4.3/§6.3.
+-- Additive tables only; legacy boards get them via _migrate_add_optional_columns.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS evaluation_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- K05 envelope REQUIRED (line 186)
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'evaluation_event'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    status                TEXT    NOT NULL CHECK (status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    -- K05 §6.2 data REQUIRED (line 429)
+    eval_run_id           TEXT    NOT NULL,
+    suite                 TEXT    NOT NULL,
+    case_ref              TEXT    NOT NULL,
+    criterion_ref         TEXT    NOT NULL,
+    verdict               TEXT    NOT NULL CHECK (verdict IN (
+        'pass','fail','inconclusive','blocked')),
+    subject_model         TEXT    NOT NULL,
+    subject_provider      TEXT    NOT NULL,
+    -- BUILD-02 correlation spine (BUILD-01)
+    run_id                INTEGER NOT NULL,   -- task_runs.id; enforced app-level
+    -- K05 §6.2 data OPTIONAL
+    score                 REAL,
+    judge                 TEXT,
+    tokens_input          INTEGER,
+    tokens_output         INTEGER,
+    data_latency_ms       INTEGER,
+    subject_prompt_version TEXT,
+    subject_config_version INTEGER,
+    hard_fail_classes     TEXT,   -- JSON array ["HF-01",...]
+    data_evidence_refs    TEXT,   -- JSON array
+    -- K05 envelope OPTIONAL fields
+    execution_id          TEXT,
+    task_id               TEXT,
+    session_id            TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,  -- envelope latency
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,    -- $.error (envelope path)
+    data_error_json       TEXT,    -- $.data.error (data path)
+    created_at            INTEGER NOT NULL,
+    UNIQUE (suite, eval_run_id)   -- K05 "suite-local unique id"
+);
+CREATE INDEX IF NOT EXISTS idx_eval_events_run    ON evaluation_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_eval_events_case   ON evaluation_events(suite, case_ref);
+CREATE INDEX IF NOT EXISTS idx_eval_events_ts     ON evaluation_events(timestamp);
+
+CREATE TABLE IF NOT EXISTS reflection_records (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- K05 envelope REQUIRED
+    schema_version        INTEGER NOT NULL CHECK (schema_version = 1),
+    event_id              TEXT    NOT NULL UNIQUE,
+    event_type            TEXT    NOT NULL CHECK (event_type = 'reflection_record'),
+    timestamp             TEXT    NOT NULL,
+    config_version        INTEGER NOT NULL CHECK (config_version >= 1),
+    event_status          TEXT    NOT NULL CHECK (event_status IN (
+        'RUNNING','SUCCESS','FAILED','BLOCKED','TIMEOUT','CANCELLED',
+        'INCONCLUSIVE','SECURITY_DENIED','PROVIDER_ERROR','RATE_LIMITED')),
+    -- K05 §6.3 data REQUIRED (line 496)
+    scope                 TEXT    NOT NULL CHECK (scope IN (
+        'memory','skill','invariant','process','security')),
+    finding               TEXT    NOT NULL,
+    reflection_status     TEXT    NOT NULL CHECK (reflection_status IN (
+        'captured','triaged','resolved','actioned','dismissed')),
+    -- BUILD-02 correlation (nullable per §6.3)
+    run_id                INTEGER,
+    task_id               TEXT,
+    session_id            TEXT,   -- $.session_id (envelope)
+    -- K05 envelope OPTIONAL
+    execution_id          TEXT,
+    parent_run_id         TEXT,
+    agent_profile         TEXT,
+    model                 TEXT,
+    provider              TEXT,
+    prompt_version_hash   TEXT,
+    prompt_version_revision INTEGER,
+    tool_name             TEXT,
+    latency_ms            INTEGER,
+    evidence_refs         TEXT,
+    artifact_hashes       TEXT,
+    source_event_ids      TEXT,
+    supersedes_event_id   TEXT,
+    cost_json             TEXT,
+    review_json           TEXT,
+    parent_version_json   TEXT,
+    error_json            TEXT,    -- $.error (envelope)
+    -- K05 §6.3 data OPTIONAL
+    turn_ref              TEXT,
+    suggested_action      TEXT,
+    severity              TEXT    CHECK (severity IS NULL OR
+        severity IN ('info','low','medium','high','critical')),
+    data_session_id       TEXT,    -- $.data.session_id (data-level)
+    data_evidence_refs    TEXT,
+    data_source_event_ids TEXT,
+    data_error_json       TEXT,    -- $.data.error (data path)
+    created_at            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refl_run           ON reflection_records(run_id);
+CREATE INDEX IF NOT EXISTS idx_refl_ts            ON reflection_records(timestamp);
 """
 
 
@@ -1862,6 +1982,14 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    # BUILD-01: compute latency_ms at run-close (milliseconds, same clock as
+    # the rest of the task_runs timestamps).  NULL if the run was opened without
+    # a started_at (legacy row or manual edit) — K09 §6.1 allows NULL for
+    # historical fields.
+    latency_ms = _b01_latency_ms(conn, run_id)
+    # BUILD-01 envelope-metadata merge (_b01_envelope_meta) intentionally NOT
+    # re-applied from accb97729b: it changes the observable task_runs.metadata
+    # contract that upstream tests pin exactly. See Step-8 audit.
     conn.execute(
         """
         UPDATE task_runs
@@ -1870,6 +1998,7 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               latency_ms    = ?,
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
@@ -1877,7 +2006,7 @@ def _end_run(
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (status or outcome, outcome, summary, error, _json_or_null(metadata), latency_ms, now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
@@ -1897,6 +2026,68 @@ def _opt_int(value: Any) -> Optional[int]:
 def _json_or_null(obj: Any) -> Optional[str]:
     """JSON text for a payload/metadata column; falsy -> NULL."""
     return json.dumps(obj, ensure_ascii=False) if obj else None
+
+
+# -----------------------------------------------------------------------------
+# BUILD-01 forward port: K05 telemetry/correlation foundations
+# Canonical contract: K09 §6.1 AC1..AC4, K05 D-11 (_config_version chain),
+# K05 §4 envelope defaults (schema_version/cost_state). All additive, nullable,
+# fail-closed.
+# -----------------------------------------------------------------------------
+
+def _b01_config_version() -> str:
+    """Return the on-disk ``_config_version`` (e.g. ``"40"``) as a string.
+
+    Lazy wrapper around ``hermes_cli.config.check_config_version`` so the
+    instrumentation code stays decoupled from config import order. Returns
+    ``"unknown"`` when the version cannot be read — K07 requires UNKNOWN to
+    be distinct from zero, never promoted to ``"0"``.
+    """
+    try:
+        from hermes_cli.config import check_config_version
+    except Exception:  # pragma: no cover - defensive only
+        return "unknown"
+    try:
+        current, _latest = check_config_version()
+        return str(current) if current is not None else "unknown"
+    except Exception:  # pragma: no cover - defensive only
+        return "unknown"
+
+
+def _b01_envelope_meta(extra: Optional[dict] = None) -> Optional[dict]:
+    """Merge BUILD-01 envelope defaults into ``extra`` (never overrides).
+
+    Returns ``None`` when the merged result is empty so the caller's
+    ``if ... else None`` short-circuit stays intact for callers that pass
+    no metadata at all (preserving pre-BUILD-01 behavior).
+    """
+    b01_defaults = {
+        "schema_version": "kanban_v1.0",
+        "cost_state": "unknown",
+    }
+    if extra is None:
+        return b01_defaults
+    merged = dict(extra)
+    for k, v in b01_defaults.items():
+        merged.setdefault(k, v)
+    return merged
+
+
+def _b01_latency_ms(conn: sqlite3.Connection, run_id: int) -> Optional[int]:
+    """Compute run latency in milliseconds (time.time() * 1000 based).
+
+    ``started_at`` is INTEGER seconds; NULL started_at (legacy, or patched)
+    leaves latency_ms NULL — K09 §6.1 permits missing historical fields
+    represented as NULL.
+    """
+    row = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if not row or not row["started_at"]:
+        return None
+    now_ms = int(time.time() * 1000)
+    started_ms = int(row["started_at"]) * 1000
+    return max(0, now_ms - started_ms)
 
 
 def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -1942,12 +2133,13 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
-            started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, ended_at, latency_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key, outcome, outcome, summary, error, _json_or_null(metadata),
             now, now,
+            0,  # synthetic: zero-duration (started_at == ended_at)
         ),
     )
     return int(cur.lastrowid or 0)
@@ -2110,12 +2302,13 @@ def _claim_and_open_run(
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            started_at, config_version
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
             lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            _b01_config_version(),
         ),
     )
     run_id = run_cur.lastrowid
@@ -2546,6 +2739,9 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from agent.graph.kanban import completion_allowed
+    if not completion_allowed(conn, task_id):
+        return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
@@ -2559,6 +2755,8 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if not completion_allowed(conn, task_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -3236,16 +3434,20 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
+        # BUILD-01: compute latency for the reclaimed run (same logic as
+        # _end_run). started_at may be NULL on legacy rows; latency_ms stays
+        # NULL then (K09 §6.1). Recovery path is append-only, never rewrites.
+        _b01_latency = _b01_latency_ms(conn, int(stale["current_run_id"]))
         conn.execute(
             """
             UPDATE task_runs
                SET status = 'reclaimed', outcome = 'reclaimed',
                    summary = COALESCE(summary, ?),
-                   ended_at = ?,
+                   ended_at = ?, latency_ms = ?,
                    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
              WHERE id = ? AND ended_at IS NULL
             """,
-            (note, now, int(stale["current_run_id"])),
+            (note, now, _b01_latency, int(stale["current_run_id"])),
         )
 
 
@@ -4024,6 +4226,451 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# BUILD-02 (Evaluation Events + Reflection Records) — K05 §6.2/§6.3, K09 §6.2
+# ---------------------------------------------------------------------------
+class RefusedError(Exception):
+    """Raised when a BUILD-02 payload is rejected by a hard validation rule."""
+
+
+from hermes_cli.eval_schema import (
+    VALIDATOR_REGISTRY,
+    validate_evaluation_event as _validate_eval,
+    validate_reflection_record as _validate_refl,
+    event_fingerprint,
+    CANONICAL_ENVELOPE_STATUS,
+    CANONICAL_VERDICT,
+    CANONICAL_REFLECTION_STATUS,
+    CANONICAL_REFLECTION_SCOPE,
+)
+
+
+# Canonical ordered column list for evaluation_events, EXCLUDING the
+# AUTOINCREMENT `id`. This is the single source of truth for the INSERT:
+# column list, named placeholders, and the parameter dict are all derived
+# from it programmatically -- no manually counted '?' sequence anywhere.
+# Must match PRAGMA table_info(evaluation_events) minus 'id' exactly
+# (verified by _verify_eval_schema_once at first use per connection).
+_EVAL_EVENT_COLUMNS: tuple = (
+    "schema_version", "event_id", "event_type", "timestamp",
+    "config_version", "status",
+    "eval_run_id", "suite", "case_ref", "criterion_ref", "verdict",
+    "subject_model", "subject_provider",
+    "run_id",
+    "score", "judge", "tokens_input", "tokens_output", "data_latency_ms",
+    "subject_prompt_version", "subject_config_version",
+    "hard_fail_classes", "data_evidence_refs",
+    "execution_id", "task_id", "session_id", "parent_run_id",
+    "agent_profile", "model", "provider",
+    "prompt_version_hash", "prompt_version_revision",
+    "tool_name", "latency_ms", "evidence_refs", "artifact_hashes",
+    "source_event_ids", "supersedes_event_id",
+    "cost_json", "review_json", "parent_version_json", "error_json",
+    "data_error_json", "created_at",
+)
+
+_EVAL_EVENT_INSERT_SQL = (
+    "INSERT INTO evaluation_events (" + ", ".join(_EVAL_EVENT_COLUMNS) + ") "
+    "VALUES (" + ", ".join(f":{c}" for c in _EVAL_EVENT_COLUMNS) + ")"
+)
+
+_EVAL_JSON_COLUMNS = frozenset((
+    "hard_fail_classes", "data_evidence_refs", "evidence_refs",
+    "artifact_hashes", "source_event_ids", "cost_json", "review_json",
+    "parent_version_json", "error_json", "data_error_json",
+))
+
+# Canonical ordered column list for reflection_records, EXCLUDING the
+# AUTOINCREMENT `id`. Same single-source-of-truth pattern as
+# _EVAL_EVENT_COLUMNS so the INSERT/params are derived, never hand-counted.
+# Must match PRAGMA table_info(reflection_records) minus 'id' exactly.
+_REFLECTION_COLUMNS: tuple = (
+    "schema_version", "event_id", "event_type", "timestamp",
+    "config_version", "event_status",
+    "scope", "finding", "reflection_status",
+    "run_id", "task_id", "session_id",
+    "execution_id", "parent_run_id", "agent_profile", "model",
+    "provider", "prompt_version_hash", "prompt_version_revision",
+    "tool_name", "latency_ms", "evidence_refs", "artifact_hashes",
+    "source_event_ids", "supersedes_event_id", "cost_json",
+    "review_json", "parent_version_json", "error_json",
+    "turn_ref", "suggested_action", "severity", "data_session_id",
+    "data_evidence_refs", "data_source_event_ids", "data_error_json",
+    "created_at",
+)
+
+_REFLECTION_INSERT_SQL = (
+    "INSERT INTO reflection_records (" + ", ".join(_REFLECTION_COLUMNS) + ") "
+    "VALUES (" + ", ".join(f":{c}" for c in _REFLECTION_COLUMNS) + ")"
+)
+
+_REFLECTION_JSON_COLUMNS = frozenset((
+    "evidence_refs", "artifact_hashes", "source_event_ids", "cost_json",
+    "review_json", "parent_version_json", "error_json",
+    "data_evidence_refs", "data_source_event_ids", "data_error_json",
+))
+
+_eval_schema_verified: set = set()
+
+
+def _verify_eval_schema_once(conn: sqlite3.Connection) -> None:
+    """Fail closed if evaluation_events' live DDL drifts from the canonical
+    column list. Runs once per connection (cheap PRAGMA, cached by id())."""
+    key = id(conn)
+    if key in _eval_schema_verified:
+        return
+    live_cols = [
+        row[1] for row in conn.execute("PRAGMA table_info(evaluation_events)")
+        if row[1] != "id"
+    ]
+    if list(live_cols) != list(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            "SCHEMA_CONTRACT_MISMATCH: evaluation_events live columns "
+            f"{live_cols!r} != canonical _EVAL_EVENT_COLUMNS "
+            f"{list(_EVAL_EVENT_COLUMNS)!r}"
+        )
+    _eval_schema_verified.add(key)
+
+
+def _eval_payload_to_params(payload: dict) -> dict:
+    """Serialize a payload dict to the exact named-parameter set the INSERT
+    needs, deterministically derived from _EVAL_EVENT_COLUMNS -- never a
+    manually counted tuple. Fails closed (before touching sqlite) if the
+    payload doesn't exactly cover the canonical column set."""
+    missing = [c for c in _EVAL_EVENT_COLUMNS if c not in payload]
+    if missing:
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: payload missing columns {missing}"
+        )
+    extra = [k for k in payload if k not in _EVAL_EVENT_COLUMNS]
+    if extra:
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: payload has undeclared columns {extra}"
+        )
+    if len(set(_EVAL_EVENT_COLUMNS)) != len(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            "INTERNAL_INVARIANT_VIOLATION: duplicate column name in "
+            "_EVAL_EVENT_COLUMNS"
+        )
+    params = {}
+    for col in _EVAL_EVENT_COLUMNS:
+        val = payload[col]
+        if col in _EVAL_JSON_COLUMNS and val is not None:
+            val = json.dumps(val, ensure_ascii=False)
+        params[col] = val
+    if len(params) != len(_EVAL_EVENT_COLUMNS):
+        raise RuntimeError(
+            f"INTERNAL_INVARIANT_VIOLATION: parameter count {len(params)} != "
+            f"column count {len(_EVAL_EVENT_COLUMNS)}"
+        )
+    return params
+
+
+def record_evaluation_event(
+    conn: sqlite3.Connection,
+    *,
+    # envelope
+    event_id: str,
+    timestamp: str,
+    status: str,
+    # data
+    eval_run_id: str,
+    suite: str,
+    case_ref: str,
+    criterion_ref: str,
+    verdict: str,
+    subject_model: str,
+    subject_provider: str,
+    config_version: Optional[int] = None,
+    # optional envelope
+    run_id: Optional[int] = None,
+    execution_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    prompt_version_hash: Optional[str] = None,
+    prompt_version_revision: Optional[int] = None,
+    tool_name: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    evidence_refs: Optional[list] = None,
+    artifact_hashes: Optional[dict] = None,
+    source_event_ids: Optional[list] = None,
+    supersedes_event_id: Optional[str] = None,
+    cost_json: Optional[dict] = None,
+    review_json: Optional[dict] = None,
+    parent_version_json: Optional[dict] = None,
+    error_json: Optional[dict] = None,
+    # optional data
+    score: Optional[float] = None,
+    judge: Optional[str] = None,
+    tokens_input: Optional[int] = None,
+    tokens_output: Optional[int] = None,
+    data_latency_ms: Optional[int] = None,
+    subject_prompt_version: Optional[str] = None,
+    subject_config_version: Optional[int] = None,
+    hard_fail_classes: Optional[list] = None,
+    data_evidence_refs: Optional[list] = None,
+    data_error_json: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Insert a canonical EvaluationEvent (K05 §6.2) into evaluation_events.
+
+    Validates against K05 §6.2 and §4.3 before writing. Returns the row id
+    on success, or the existing row id on idempotent retry (identical
+    canonical payload). Raises ``RefusedError`` on hard validation failure.
+
+    Idempotency rules:
+      - Composite key (suite, eval_run_id), same fingerprint → return existing id
+      - Key collision + divergent payload → RefusedError
+      - Same event_id + different key → RefusedError
+    """
+    import time as _time
+
+    ok, reason = _validate_eval(
+        schema_version=1, event_id=event_id, event_type="evaluation_event",
+        timestamp=timestamp, config_version=config_version if config_version is not None else -1,
+        status=status,
+        eval_run_id=eval_run_id, suite=suite, case_ref=case_ref,
+        criterion_ref=criterion_ref, verdict=verdict,
+        subject_model=subject_model, subject_provider=subject_provider,
+        score=score, evidence_refs=evidence_refs,
+    )
+    if not ok:
+        raise RefusedError(reason)
+
+    # K05 E-14: envelope config_version is NOT NULL (§4.3 required, minimum 1)
+    if config_version is None or config_version < 1:
+        raise RefusedError(
+            f"config_version must be an integer >= 1 (K05 §4.3 required, E-14), got {config_version!r}"
+        )
+
+    # K05 E-05 + BUILD-02 correlation spine: run_id is REQUIRED for
+    # evaluation_events and must reference an existing task_runs.id.
+    # Fail closed before the INSERT (FK-style check).
+    if run_id is None:
+        raise RefusedError("run_id is required for evaluation_events (K05 §6.2 correlation spine)")
+    _run_exists = conn.execute(
+        "SELECT id FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if _run_exists is None:
+        raise RefusedError(f"orphan run_id {run_id}: no matching task_runs.id")
+
+    now = int(_time.time())
+    if created_at is None:
+        created_at = now
+
+    payload = {
+        "schema_version": 1, "event_id": event_id,
+        "event_type": "evaluation_event", "timestamp": timestamp,
+        "config_version": config_version, "status": status,
+        "eval_run_id": eval_run_id, "suite": suite, "case_ref": case_ref,
+        "criterion_ref": criterion_ref, "verdict": verdict,
+        "subject_model": subject_model, "subject_provider": subject_provider,
+        "run_id": run_id,
+        "score": score, "judge": judge,
+        "subject_prompt_version": subject_prompt_version,
+        "subject_config_version": subject_config_version,
+        "hard_fail_classes": hard_fail_classes,
+    }
+    fp = event_fingerprint(payload)
+
+    with write_txn(conn, allow_nested=True):
+        # Check composite key
+        existing = conn.execute(
+            "SELECT id, event_id, eval_run_id, suite, case_ref, criterion_ref, verdict, "
+            "subject_model, subject_provider, status, event_type, timestamp, "
+            "config_version, run_id, score, judge, subject_prompt_version, "
+            "subject_config_version, hard_fail_classes, schema_version "
+            "FROM evaluation_events WHERE suite = ? AND eval_run_id = ?",
+            (suite, eval_run_id)
+        ).fetchone()
+        if existing is not None:
+            # Build fingerprint of the existing row using the SAME canonical
+            # field subset and pre-serialization form as the incoming payload.
+            existing_raw = {k: existing[k] for k in existing.keys()}
+            # JSON columns in the DB are stored serialized; round-trip hard_fail_classes
+            if existing_raw.get("hard_fail_classes") is not None:
+                existing_raw["hard_fail_classes"] = json.loads(existing_raw["hard_fail_classes"])
+            existing_fp = event_fingerprint(existing_raw)
+            if existing_fp == fp:
+                return int(existing[0])
+            # Same key, different payload — hard reject
+            if existing["event_id"] != event_id:
+                raise RefusedError(
+                    f"event_id collision: incoming '{event_id}' vs existing "
+                    f"'{existing['event_id']}' on key (suite={suite}, "
+                    f"eval_run_id={eval_run_id})"
+                )
+            raise RefusedError(
+                f"evaluation event conflict on (suite={suite}, "
+                f"eval_run_id={eval_run_id}): canonical payload diverges "
+                f"(existing event_id='{existing['event_id']}')"
+            )
+
+        check = conn.execute(
+            "SELECT id FROM evaluation_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if check is not None:
+            raise RefusedError(
+                f"event_id '{event_id}' already exists for different key "
+                f"(event_id is globally unique)"
+            )
+
+        _verify_eval_schema_once(conn)
+
+        # Build parameter dict in canonical column order (derived from
+        # _EVAL_EVENT_COLUMNS, not manually counted)
+        full_payload = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "event_type": "evaluation_event",
+            "timestamp": timestamp,
+            "config_version": config_version,
+            "status": status,
+            "eval_run_id": eval_run_id,
+            "suite": suite,
+            "case_ref": case_ref,
+            "criterion_ref": criterion_ref,
+            "verdict": verdict,
+            "subject_model": subject_model,
+            "subject_provider": subject_provider,
+            "run_id": run_id,
+            "score": score,
+            "judge": judge,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "data_latency_ms": data_latency_ms,
+            "subject_prompt_version": subject_prompt_version,
+            "subject_config_version": subject_config_version,
+            "hard_fail_classes": hard_fail_classes,
+            "data_evidence_refs": data_evidence_refs,
+            "execution_id": execution_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "parent_run_id": parent_run_id,
+            "agent_profile": agent_profile,
+            "model": model,
+            "provider": provider,
+            "prompt_version_hash": prompt_version_hash,
+            "prompt_version_revision": prompt_version_revision,
+            "tool_name": tool_name,
+            "latency_ms": latency_ms,
+            "evidence_refs": evidence_refs,
+            "artifact_hashes": artifact_hashes,
+            "source_event_ids": source_event_ids,
+            "supersedes_event_id": supersedes_event_id,
+            "cost_json": cost_json,
+            "review_json": review_json,
+            "parent_version_json": parent_version_json,
+            "error_json": error_json,
+            "data_error_json": data_error_json,
+            "created_at": created_at,
+        }
+        params = _eval_payload_to_params(full_payload)
+
+        # Execute with the canonical SQL and verified parameter count
+        cur = conn.execute(_EVAL_EVENT_INSERT_SQL, params)
+        return int(cur.lastrowid)
+
+
+def record_reflection_record(
+    conn: sqlite3.Connection,
+    *,
+    # envelope
+    event_id: str,
+    timestamp: str,
+    event_status: str,
+    config_version: Optional[int] = None,
+    # data
+    scope: str,
+    finding: str,
+    reflection_status: str,
+    # optional envelope
+    run_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    prompt_version_hash: Optional[str] = None,
+    prompt_version_revision: Optional[int] = None,
+    tool_name: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    evidence_refs: Optional[list] = None,
+    artifact_hashes: Optional[dict] = None,
+    source_event_ids: Optional[list] = None,
+    supersedes_event_id: Optional[str] = None,
+    cost_json: Optional[dict] = None,
+    review_json: Optional[dict] = None,
+    parent_version_json: Optional[dict] = None,
+    error_json: Optional[dict] = None,
+    # optional data
+    turn_ref: Optional[str] = None,
+    suggested_action: Optional[str] = None,
+    severity: Optional[str] = None,
+    data_session_id: Optional[str] = None,
+    data_evidence_refs: Optional[list] = None,
+    data_source_event_ids: Optional[list] = None,
+    data_error_json: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Insert a canonical ReflectionRecord (K05 §6.3).
+
+    No business logic, no LLM calls, no pattern extraction — pure storage.
+    Returns the row id.
+    """
+    import time as _time
+
+    ok, reason = _validate_refl(
+        schema_version=1, event_id=event_id, event_type="reflection_record",
+        timestamp=timestamp, config_version=config_version if config_version is not None else -1,
+        event_status=event_status,
+        scope=scope, finding=finding, reflection_status=reflection_status,
+    )
+    if not ok:
+        raise RefusedError(reason)
+
+    # K05 E-14: config_version is required >= 1. Fail closed with RefusedError
+    # (mirrors record_evaluation_event) instead of substituting -1, which
+    # would let the DB CHECK(config_version >= 1) fire as a raw
+    # sqlite3.IntegrityError.
+    if config_version is None or config_version < 1:
+        raise RefusedError(
+            f"config_version must be an integer >= 1 (K05 E-14), got {config_version!r}"
+        )
+
+    if created_at is None:
+        created_at = int(_time.time())
+
+    with write_txn(conn, allow_nested=True):
+        check = conn.execute(
+            "SELECT id FROM reflection_records WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if check is not None:
+            raise RefusedError(
+                f"reflection_record event_id '{event_id}' already exists"
+            )
+
+        params = {}
+        for col in _REFLECTION_COLUMNS:
+            if col == "schema_version":
+                val = 1
+            elif col == "event_type":
+                val = "reflection_record"
+            else:
+                val = locals().get(col)
+            if col in _REFLECTION_JSON_COLUMNS and val is not None:
+                val = json.dumps(val, ensure_ascii=False)
+            params[col] = val
+        cur = conn.execute(_REFLECTION_INSERT_SQL, params)
+        return int(cur.lastrowid)
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---

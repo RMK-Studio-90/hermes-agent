@@ -44,6 +44,11 @@ import type { LocalModelLoadProgress, ModelOptionProvider, ModelOptionsResponse 
 
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
+/** The virtual provider slug behind the AUTO / ROUTING selection row
+ *  (hermes_cli.inventory.ROUTING_PROFILE_ROW_SLUG). No configured provider
+ *  carries this slug, so the backend row is unambiguous. */
+const ROUTING_PROVIDER_SLUG = 'routing'
+
 // Lets the host dropdown (model-pill, a kanban field trigger, …) hand the panel
 // a way to dismiss itself so clicking a model row commits + closes, while the
 // hover-revealed edit submenu (reasoning/fast) stays open to play with (its
@@ -77,6 +82,10 @@ export interface ModelMenuController {
   presetFor: (provider: string, model: string) => { effort?: string; fast?: boolean }
   /** Commit a model row. Return false to abort (a failed session switch). */
   select: (model: string, provider: string) => Promise<boolean | void> | void
+  /** Commit an RMK routing profile (rmk-smart, rmk-fast, …). When absent, the
+   *  AUTO / ROUTING section is hidden entirely — surfaces that cannot carry a
+   *  routing-mode selection (per-task overrides) opt out by omitting it. */
+  selectRoutingProfile?: (profile: string) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
   setOptions: (
     patch: { effort?: string; fast?: boolean },
@@ -238,11 +247,26 @@ export function ModelCatalogMenu({
     [providers, includeMoa]
   )
 
+  // RMK routing profiles arrive as a virtual `routing` provider row. They are
+  // selectable operating modes, NOT physical providers/models, so they get
+  // their own section and never enter the model groups or MoA presets.
+  const routingProviderRow = useMemo(
+    () => providers?.find(p => p.slug.toLowerCase() === ROUTING_PROVIDER_SLUG),
+    [providers]
+  )
+  const routingProfiles = useMemo(() => routingProviderRow?.models ?? [], [routingProviderRow])
+  const routingProfileLabels = useMemo(() => routingProviderRow?.model_labels ?? {}, [routingProviderRow])
+  // Active profile is backend-authoritative (explicit routing.profile, else the
+  // default when adaptive routing is on). Null/'' -> legacy pinned mode.
+  const activeRoutingProfile = modelOptions.data?.routing_profile || null
+  const hasRoutingSection = Boolean(controller.selectRoutingProfile && routingProfiles.length > 0)
+
   const pickerProviders = useMemo(
     () =>
       providers?.filter(
         provider =>
           provider.slug.toLowerCase() !== 'moa' &&
+          provider.slug.toLowerCase() !== ROUTING_PROVIDER_SLUG &&
           // Strict --local gate: staged local models exist on disk, but
           // without the flag the GUI doesn't offer them.
           (localModelsEnabled || provider.slug !== LOCAL_PROVIDER_SLUG)
@@ -312,15 +336,27 @@ export function ModelCatalogMenu({
     closeMenu()
   }
 
+  const selectRoutingProfile = async (profile: string) => {
+    if ((await controller.selectRoutingProfile?.(profile)) === false) {
+      return
+    }
+
+    closeMenu()
+  }
+
   // ── Keyboard selection (cmdk semantics on a Radix menu) ───────────────────
   // One flat list mirroring EXACTLY what's rendered (collapse, filter, presets),
   // so the selection can never sit on a hidden row.
   type KbRow =
     | { family: ModelFamily; key: string; kind: 'family'; provider: ModelOptionProvider }
     | { key: string; kind: 'moa'; preset: string }
+    | { key: string; kind: 'routing'; profile: string }
 
   const kbRows = useMemo<KbRow[]>(
     () => [
+      ...(hasRoutingSection && !search
+        ? routingProfiles.map((profile): KbRow => ({ key: `routing:${profile}`, kind: 'routing', profile }))
+        : []),
       ...groups.flatMap(group =>
         collapsedProviders.includes(group.provider.slug) && !search
           ? []
@@ -333,7 +369,7 @@ export function ModelCatalogMenu({
       ),
       ...shownMoaPresets.map((preset): KbRow => ({ key: `moa:${preset}`, kind: 'moa', preset }))
     ],
-    [groups, collapsedProviders, search, shownMoaPresets]
+    [groups, collapsedProviders, hasRoutingSection, routingProfiles, search, shownMoaPresets]
   )
 
   const [kbOverride, setKbOverride] = useState<null | number>(null)
@@ -342,10 +378,12 @@ export function ModelCatalogMenu({
   const pointerQuiet = usePointerQuiet()
 
   const rowIsCurrent = (row: KbRow) =>
-    row.kind === 'moa'
-      ? current.provider === 'moa' && row.preset === current.model
-      : catalogProviderMatches(row.provider, current.provider) &&
-        (row.family.id === current.model || row.family.fastId === current.model)
+    row.kind === 'routing'
+      ? activeRoutingProfile === row.profile
+      : row.kind === 'moa'
+        ? current.provider === 'moa' && row.preset === current.model
+        : catalogProviderMatches(row.provider, current.provider) &&
+          (row.family.id === current.model || row.family.fastId === current.model)
 
   const autoIndex = q ? (kbRows.length > 0 ? 0 : -1) : kbRows.findIndex(row => rowIsCurrent(row))
 
@@ -366,6 +404,12 @@ export function ModelCatalogMenu({
     const row = kbIndex >= 0 ? kbRows[kbIndex] : undefined
 
     if (!row) {
+      return
+    }
+
+    if (row.kind === 'routing') {
+      void selectRoutingProfile(row.profile)
+
       return
     }
 
@@ -428,6 +472,44 @@ export function ModelCatalogMenu({
 
       <DropdownMenuSeparator className="mx-0" />
 
+      {/* AUTO / ROUTING — first-class selection, pinned above the physical
+          model groups. Rows are operating modes, not providers/models: picking
+          one commits routing.profile and drops any physical-model pin (the
+          router then picks from the full registry pool every turn). Hidden
+          while searching so a filter can never commit a mode by accident. */}
+      {!search && hasRoutingSection ? (
+        <>
+          <DropdownMenuGroup className="py-0.5">
+            <DropdownMenuLabel className={dropdownMenuSectionLabel}>
+              {routingProviderRow?.name || 'AUTO / ROUTING'}
+            </DropdownMenuLabel>
+            {routingProfiles.map(profile => {
+              const isCurrent = activeRoutingProfile === profile
+              const label = routingProfileLabels[profile] || profile
+
+              return (
+                <DropdownMenuItem
+                  key={`routing:${profile}`}
+                  onSelect={event => {
+                    event.preventDefault()
+                    void selectRoutingProfile(profile)
+                  }}
+                  {...kbRowProps(`routing:${profile}`)}
+                >
+                  <span className="min-w-0 flex-1 truncate">
+                    <HighlightMatches foldSeparators query={search} text={label} />
+                  </span>
+                  {isCurrent ? (
+                    <Codicon className={cn('ml-auto text-foreground')} name="check" size="0.75rem" />
+                  ) : null}
+                </DropdownMenuItem>
+              )
+            })}
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator className="mx-0" />
+        </>
+      ) : null}
+
       {loading ? (
         <DropdownMenuGroup className="py-1">
           {Array.from({ length: 4 }, (_, index) => (
@@ -445,7 +527,7 @@ export function ModelCatalogMenu({
         <DropdownMenuItem className={dropdownMenuRow} disabled>
           {error}
         </DropdownMenuItem>
-      ) : groups.length === 0 && moaPresets.length === 0 && shownDownloads.length === 0 ? (
+      ) : groups.length === 0 && moaPresets.length === 0 && shownDownloads.length === 0 && !hasRoutingSection ? (
         <DropdownMenuItem className={dropdownMenuRow} disabled>
           {copy.noModels}
         </DropdownMenuItem>

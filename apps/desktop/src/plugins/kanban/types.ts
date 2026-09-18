@@ -1,3 +1,5 @@
+import type { GraphProgressData } from './graph-progress'
+
 /** The slice of the kanban REST contract the board renders. The backend
  *  (`plugins/kanban/dashboard/plugin_api.py`) returns much more per task; we
  *  type only what the UI reads so a schema addition never breaks the build. */
@@ -114,6 +116,7 @@ export interface KanbanTaskFull extends KanbanTask {
 /** GET /tasks/:id — the task plus its related collections, which are SIBLINGS
  *  of `task`, not nested inside it. */
 export interface KanbanTaskDetail {
+  graph?: GraphProgressData | null
   task: KanbanTaskFull
   comments: KanbanComment[]
   events: KanbanEvent[]
