@@ -1833,12 +1833,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     from agent.routing.integration import is_enabled
     if is_enabled() and reason is not None:
-        from agent.routing.override import allows_fallback, resolve_override
-        if not allows_fallback(resolve_override(), reason):
-            return False
+        from agent.routing.health import action_for
+        from agent.routing.override import OverrideMode, resolve_override
+        ov = resolve_override()
+        # STRICT ROUTE/PROVIDER pin: never deviate — not even as a last resort
+        # (correction #3: the user pinned an exact route and accepts its fate).
+        # STRICT MODEL pin: deviate only for transport-shaped failures; the
+        # recovery selector constrains the pool to the same model. SOFT/auto
+        # keep the historical best-effort chain walk: terminal callers that
+        # previously passed no reason bypassed this gate, and request-shaped
+        # reasons (kind == "none": content policy, format, ...) must not block
+        # that last-resort walk — health never penalises the primary for them.
+        if ov.is_active and ov.mode == OverrideMode.STRICT:
+            return ov.is_model_pin and action_for(reason).kind != "none"
     # Adaptive routing (config flag ``routing.adaptive.enabled``, default off):
     # health-aware reorder of the UNWALKED fallback tail. It never adds/removes
-    # entries, is a no-op when the flag is off, and swallows every error.
+    # entries, is a no-op when the flag is off, and swallows every error — so the
+    # chain walk below is byte-identical to previous behaviour in the default config.
     try:
         from agent.routing.integration import reorder_fallback_chain
         reorder_fallback_chain(agent, reason)
@@ -1855,6 +1866,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        # HEAD walks the chain with ``continue``; the original hunk recursed.
         if is_enabled() and (fb_provider, fb_model) not in getattr(agent, "_routing_allowed_routes", set()):
             continue
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):

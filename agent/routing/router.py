@@ -130,36 +130,155 @@ class AdaptiveRouter:
 
         if ov.is_active:
             target = _norm(ov.target)
+            if ov.is_model_pin:
+                # MODEL-intent pin: the user pinned a *model*, not a provider.
+                # Resolve it against the registry — pick the best eligible route
+                # serving that model across providers. Billing / capability /
+                # health gates still apply (Free-First among equal providers);
+                # only the provider choice is left to the router, so a transient
+                # outage on one of them cannot strand the pin at select time.
+                from dataclasses import replace
+                _routes = self.registry.routes_for_model(target[1])
+                if not _routes:
+                    auto = self._auto(ctx)
+                    auto.why["override"] = {"source": ov.source, "mode": ov.mode.value,
+                                            "note": f"model {target[1]!r} unregistered -> auto",
+                                            "forced": False}
+                    return auto
+                narrowed = replace(ctx, candidate_routes=list(_routes))
+                auto = self._auto(narrowed)
+                auto.why["override"] = {"source": ov.source, "mode": ov.mode.value,
+                                        "forced": ov.mode == OverrideMode.STRICT,
+                                        "note": "model-intent pin -> best eligible route"}
+                return auto
             entry = self.registry.get(*target)
+            # If a logical_route is active and the override target is a known
+            # registry entry *eligible for that logical route*, DO NOT re-apply
+            # zero_paid filtering on the override. The override represents an
+            # explicit user choice that must be honored.
+            # If the target is not in the registry, or is not eligible for the
+            # active logical route, it cannot bypass V1 gates — fall through to
+            # auto selection (existing behavior for unknown/unsupported pins).
+            target_is_eligible_for_route = False
             if ctx.logical_route:
-                # A concrete pin narrows selection; it cannot bypass V1 gates.
-                decision = self._auto(replace(ctx, candidate_routes=[target]))
-                decision.mode = "override"
-                decision.why["override"] = {"source": ov.source, "mode": ov.mode.value}
-                return decision
-            if ctx.zero_paid and (entry is None or not entry.is_zero_cost):
-                return Decision(provider=None, model=None, mode="override", exhausted=True,
-                                why={"error": "NO_ELIGIBLE_MODEL", "rejected": [
-                                    {"route": list(target), "reason": "BILLING_NOT_ZERO_COST"}]})
-            forced = ov.mode == OverrideMode.STRICT
-            if entry is not None and (forced or entry.is_available(ctx.now)):
-                return Decision(
-                    provider=target[0], model=target[1], mode="override",
-                    requires_paid=not entry.is_zero_cost if ctx.zero_paid else not entry.is_free,
-                    why={"override": {"source": ov.source, "mode": ov.mode.value,
-                                       "forced": forced}},
+                # When a logical route IS active, only honor override if target
+                # is eligible for that route (avoids pinning NVIDIA nemotron
+                # which is not in rmk-code pool and would fail zero_paid gate)
+                target_is_eligible_for_route = (
+                    entry is not None
+                    and entry.logical_routes
+                    and ctx.logical_route in entry.logical_routes
                 )
-            if forced:
-                # STRICT with an unresolved target: still forced; caller will see the error.
-                return Decision(
-                    provider=target[0], model=target[1], mode="override",
-                    why={"override": {"source": ov.source, "mode": "strict",
-                                       "forced": True, "note": "target unresolved/unavailable"}},
-                )
-            # SOFT override whose target is unavailable -> fall through to auto.
+            else:
+                # No logical_route active: honor override for any known target
+                # that's in the candidate pool (original behavior)
+                target_is_eligible_for_route = entry is not None
+
+            if target_is_eligible_for_route:
+                # User selected a known model while routing is active — treat as
+                # an explicit pin. Capability gates (vision, tool_use, etc.) still
+                # apply; only the billing gate (zero_paid) is skipped on the override
+                # when a logical_route is active (because routing implies user consent
+                # to use zero-cost models from that route's pool).
+                forced = ov.mode == OverrideMode.STRICT
+                if ctx.logical_route:
+                    # With logical_route active: only honor override if target is
+                    # available, or if STRICT (then run capability check but skip
+                    # zero_paid billing gate and allow ZERO_ADDITIONAL_COST models).
+                    if forced or entry.is_available(ctx.now):
+                        # Run capability check on just this target
+                        # but skip zero_paid billing gate (routing profile consent)
+                        # Also allow_paid=True so ZERO_ADDITIONAL_COST models pass capability check
+                        from dataclasses import replace
+                        check_ctx = replace(ctx, candidate_routes=[target], zero_paid=False, allow_paid=True)
+                        auto = self._auto(check_ctx)
+                        if auto.route is None:
+                            # Capability check failed
+                            return Decision(
+                                provider=None, model=None, mode="override", exhausted=True,
+                                why={**auto.why, "override": {"source": ov.source, "mode": ov.mode.value,
+                                    "forced": forced, "note": "capability check failed"}}
+                            )
+                        # Passed capability check - use the target
+                        return Decision(
+                            provider=target[0], model=target[1], mode="override",
+                            requires_paid=not entry.is_zero_cost if ctx.zero_paid else not entry.is_free,
+                            why={"override": {"source": ov.source, "mode": ov.mode.value, "forced": forced}},
+                        )
+                    # SOFT override whose target is unavailable -> fall through to auto.
+                    auto = self._auto(ctx)
+                    auto.why["override"] = {"source": ov.source, "mode": "soft",
+                                             "note": "target unavailable -> auto"}
+                    return auto
+                else:
+                    # No logical_route: original legacy behavior - run full check including billing
+                    # STRICT forces the target regardless of availability/exclusion (but billing still applies)
+                    # SOFT only honors if available
+                    if forced:
+                        # STRICT ROUTE pin: force the target, bypass health availability
+                        # check. Billing/capability gates still apply. We cannot reuse
+                        # _auto() here — its rank_candidates applies the availability
+                        # filter (unavailable:excluded) that would defeat a STRICT pin
+                        # on a temporarily EXCLUDED route. score_candidate() scores a
+                        # single entry WITHOUT the availability filter.
+                        from agent.routing.scoring import score_candidate
+                        reject = None
+                        if ctx.zero_paid and not entry.is_zero_cost:
+                            reject = "BILLING_NOT_ZERO_COST"
+                        elif not ctx.allow_paid and not entry.is_free:
+                            reject = "BILLING_NOT_FREE"
+                        if reject is None:
+                            _sc = score_candidate(
+                                entry, ctx.required, history=self.history, now=ctx.now,
+                                now_epoch=ctx.now_epoch, half_life_seconds=ctx.half_life_seconds,
+                            )
+                            reject = _sc.rejected
+                        if reject is not None:
+                            # Check failed (billing or capability) - STRICT does not
+                            # override billing/capability.
+                            return Decision(
+                                provider=None, model=None, mode="override", exhausted=True,
+                                why={"mode": "auto", "logical_route": ctx.logical_route,
+                                     "cap_class": ctx.required.cap_class(),
+                                     "ranked": [],
+                                     "rejected": [{"route": [entry.provider, entry.model_id], "reason": reject}],
+                                     "free_available": False, "requires_paid": False,
+                                     "error": "NO_ELIGIBLE_MODEL",
+                                     "override": {"source": ov.source, "mode": "strict",
+                                                  "forced": True, "note": reject}},
+                            )
+                        return Decision(
+                            provider=target[0], model=target[1], mode="override",
+                            requires_paid=not entry.is_zero_cost if ctx.zero_paid else not entry.is_free,
+                            why={"override": {"source": ov.source, "mode": "strict", "forced": True}},
+                        )
+                    if entry.is_available(ctx.now):
+                        # SOFT: only if available, run full check including billing
+                        from dataclasses import replace
+                        check_ctx = replace(ctx, candidate_routes=[target])
+                        auto = self._auto(check_ctx)
+                        auto.mode = "override"
+                        auto.why["override"] = {"source": ov.source, "mode": ov.mode.value, "forced": False}
+                        if auto.route is None:
+                            # Check failed (billing or capability)
+                            return auto
+                        # Passed - use the target
+                        return Decision(
+                            provider=target[0], model=target[1], mode="override",
+                            requires_paid=not entry.is_zero_cost if ctx.zero_paid else not entry.is_free,
+                            why={"override": {"source": ov.source, "mode": ov.mode.value, "forced": False}},
+                        )
+                    # SOFT override whose target is unavailable -> fall through to auto.
+                    auto = self._auto(ctx)
+                    auto.why["override"] = {"source": ov.source, "mode": "soft",
+                                             "note": "target unavailable -> auto"}
+                    return auto
+            # Target is not eligible for the active logical_route (or no logical_route and unknown).
+            # Do NOT narrow to just this target — fall through to full auto selection.
+            # This lets the router pick from all eligible candidates for the route.
             auto = self._auto(ctx)
-            auto.why["override"] = {"source": ov.source, "mode": "soft",
-                                     "note": "target unavailable -> auto"}
+            auto.why["override"] = {"source": ov.source, "mode": ov.mode.value,
+                                     "note": "target not eligible for logical_route -> auto"}
             return auto
 
         # An override was supplied but failed validation (unknown target /
@@ -232,6 +351,14 @@ class AdaptiveRouter:
 
         self.registry.resolve_expiries(ctx.now)
         entries = self.registry.candidates(ctx.candidate_routes)
+        # Correction #3: a STRICT MODEL pin may only recover to another provider
+        # serving the SAME model. Narrow the pool to the pinned model so recovery
+        # never lands on a different one. Route pins never reach here — the
+        # allows_fallback() guard above already refused them.
+        _ov = ctx.override
+        if _ov.is_active and _ov.is_model_pin and _ov.mode == OverrideMode.STRICT:
+            _pinned_model = _ov.target[1]
+            entries = [e for e in entries if e.model_id == _pinned_model]
         if ctx.zero_paid:
             entries = [entry for entry in entries if entry.is_zero_cost]
         elif not ctx.allow_paid:

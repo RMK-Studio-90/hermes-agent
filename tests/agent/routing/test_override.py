@@ -85,6 +85,42 @@ def test_provider_normalised(reg: RouteRegistry) -> None:
     assert o.target == ("free", "a")
 
 
+# -- slash-in-model-id vs provider/model syntax --------------------------
+
+def test_slash_model_id_registered_under_known_provider_is_not_split() -> None:
+    """A model_id that itself contains '/' (e.g. OmniRoute's "cc/claude-opus-4-7")
+    must resolve as a MODEL-intent pin, never split at the first '/' into a
+    bogus (provider, model) pair."""
+    r = RouteRegistry(allow_network=False)
+    caps = ModelCapabilities(supports_tools=True, context_window=128000, max_output_tokens=8192)
+    r.register("omniroute", "cc/claude-opus-4-7", capabilities=caps, cost_input=0.0, cost_output=0.0)
+    o = resolve_override(turn_override="cc/claude-opus-4-7", registry=r)
+    assert o.valid is True
+    # MODEL-intent pin: provider stays None in the target (the router resolves
+    # it to a concrete route at selection time); the full string is preserved
+    # as the model_id, never corrupted by an incorrect split.
+    assert o.target == (None, "cc/claude-opus-4-7")
+    assert o.is_model_pin is True
+
+
+def test_real_provider_slash_model_syntax_still_splits(reg: RouteRegistry) -> None:
+    """A genuine 'provider/model' string, where that exact route is registered,
+    must still resolve as a provider-named route, not a model-intent pin."""
+    o = resolve_override(turn_override="openrouter/pinned", registry=reg)
+    assert o.valid is True
+    assert o.target == ("openrouter", "pinned")
+    assert o.is_model_pin is False
+
+
+def test_unregistered_slash_prefix_is_invalid_not_silent(reg: RouteRegistry) -> None:
+    """An unknown 'prefix/rest' string that matches no registered route (either
+    as provider/model or as a whole model_id) must be reported invalid, never
+    silently resolved to an unrelated model."""
+    o = resolve_override(turn_override="totallyfakeprovider/ghost-model", registry=reg)
+    assert o.valid is False
+    assert o.is_active is False
+
+
 # -- fallback permission ----------------------------------------------
 
 def test_auto_only_allows_route_failure_fallback() -> None:

@@ -27,9 +27,11 @@ def test_agent_http_route_and_bounded_recovery(monkeypatch, tmp_path, failure_st
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            # Not every POST is a chat completion. agent/model_metadata.py probes
-            # Ollama native /api/show with a "name" key; answer non-completions fast
-            # with a 404 instead of reading them as completions.
+            # Not every POST is a chat completion. agent/model_metadata.py:1205 probes
+            # Ollama's native /api/show for the context window, carrying the model under
+            # Ollama's own "name" key. That probe expects a non-Ollama server to 404 fast
+            # (see the docstring at model_metadata.py:1270), so answer it as one instead
+            # of reading it as a completion request.
             if not self.path.endswith("/chat/completions"):
                 self.send_response(404)
                 self.send_header("Content-Length", "0")

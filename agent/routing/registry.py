@@ -317,6 +317,13 @@ class RouteRegistry:
             entries = list(self._entries.values())
         return [e.snapshot(now) for e in entries]
 
+    def routes_for_model(self, model_id: str) -> List[RouteKey]:
+        """Registered routes serving ``model_id`` (any provider), sorted for
+        determinism. Used to resolve a MODEL-intent override pin (correction #3)."""
+        model_id = str(model_id).strip()
+        with self._lock:
+            return sorted(key for key in self._entries if key[1] == model_id)
+
     def clear(self) -> None:
         """Test hook: drop all entries."""
         with self._lock:

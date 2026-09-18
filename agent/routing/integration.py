@@ -22,6 +22,7 @@ Integration points
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +36,40 @@ from agent.routing.scoring import rank_candidates
 
 _LOG = logging.getLogger("hermes.routing")
 Route = Tuple[str, str]
+MANUAL_MODEL_PIN_KEY = "manual_model_pin"
+
+
+def normalize_manual_model_pin(value: Any) -> Optional[Route]:
+    """Return the persisted/runtime manual pin as a normalized route."""
+    if isinstance(value, dict):
+        provider, model = value.get("provider"), value.get("model")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        provider, model = value
+    else:
+        return None
+    route = (str(provider or "").strip().lower(), str(model or "").strip())
+    return route if route[1] else None
+
+
+def manual_model_pin(agent: Any) -> Optional[Route]:
+    """The explicit user-owned model route, if this session has one."""
+    return normalize_manual_model_pin(
+        getattr(agent, "_routing_manual_model_override", None))
+
+
+def set_manual_model_pin(agent: Any, provider: Any, model: Any) -> Optional[Route]:
+    """Stamp explicit user model intent; generic/internal switches never call this."""
+    pin = normalize_manual_model_pin((provider, model))
+    agent._routing_manual_model_override = pin
+    if pin is not None:
+        agent._routing_explicit_model = True
+    return pin
+
+
+def clear_manual_model_pin(agent: Any) -> None:
+    """Release explicit user model intent so profile/adaptive routing may govern."""
+    agent._routing_manual_model_override = None
+    agent._routing_explicit_model = False
 
 
 def is_enabled() -> bool:
@@ -82,23 +117,41 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
     )
     agent._routing_required = required
     concrete = str(getattr(agent, "model", "") or "").strip()
-    primary = (agent.provider, concrete) if concrete else None
-    # Existing conversations retain their provider/prompt prefix. Explicit model
-    # switches already use the canonical switch_model API and remain authoritative.
-    # An EMPTY model ("") is the automatic-routing sentinel, never a user pin: it
-    # must not narrow the candidate pool to an unresolvable (provider, "") route
-    # that yields NO_ELIGIBLE_MODEL before a physical model is chosen (routing #3).
-    pinned = bool(concrete) and (getattr(agent, "_routing_explicit_model", True)
-                                 or bool(conversation_history)
-                                 or bool(getattr(agent, "_cached_system_prompt", None)))
+    primary = (str(getattr(agent, "provider", "") or "").strip().lower(), concrete) if concrete else None
+    from agent.routing.profile import configured_routing_profile
+    configured_profile = configured_routing_profile(config)
+    explicit_pin = manual_model_pin(agent)
+    # Explicit /model intent is independent of the currently resolved runtime:
+    # if fallback/recovery moved the backend, the next routing pass still starts
+    # from the user's requested route. A routing profile otherwise stays fully
+    # adaptive across turns; generic switch_model() calls never create this pin.
+    if explicit_pin is not None:
+        pinned = explicit_pin
+    elif configured_profile:
+        pinned = None
+    elif bool(concrete) and getattr(agent, "_routing_explicit_model", True):
+        pinned = primary
+    else:
+        # Legacy non-profile sessions keep their established prompt/runtime pair.
+        pinned = primary if (primary and (
+            bool(conversation_history) or bool(getattr(agent, "_cached_system_prompt", None)))) else None
     from agent.routing.runtime import configured_router
     runtime = configured_router(config)
     if runtime is not None:
         from agent.routing.logical import classify_workload
-        logical = getattr(agent, "_routing_logical_route", None) or adaptive.get("route")
+        adaptive_route = adaptive.get("route") if isinstance(adaptive, dict) else None
+        # ``rmk-smart`` is the auto-classifying profile, not a logical workload
+        # route.  It must therefore leave ``route`` unset so classify_workload()
+        # derives a concrete route from the current turn.  Named profiles pin a
+        # workload class; the legacy adaptive.route remains the fallback when no
+        # selectable profile is active.
+        if configured_profile:
+            logical = None if configured_profile == "rmk-smart" else configured_profile
+        else:
+            logical = adaptive_route
         workload = classify_workload(str(user_message or ""), route=logical, vision=has_images)
         decision = ModelRouter().select_workload(
-            agent, runtime, required, workload, pinned=primary if pinned else None)
+            agent, runtime, required, workload, pinned=pinned)
         if decision.route is None:
             raise ValueError(f"NO_ELIGIBLE_MODEL: {decision.why}")
         # Execution keeps Hermes' canonical provider lifecycle. Only the pool
@@ -107,38 +160,121 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
                      str(e.get("model") or "").strip()): e
                     for e in agent._fallback_chain if isinstance(e, dict)}
         connections = connection_entries(config)
-        # Only the *eligible* candidates for this route become the fallback pool,
-        # so a mid-turn hop can never land on a model this route excluded.
+        # Only the *eligible* candidates for this route are considered, so a
+        # mid-turn hop can never land on a model this route excluded.
         eligible = [c.route for c in decision.ranked] or [decision.route]
+        # P1-1 Layer A — candidate connection admission: a candidate whose
+        # provider transport cannot be resolved must be rejected before
+        # provider execution instead of crashing switch_model mid-turn.
+        admitted, admission_rejects = admit_candidate_connections(
+            eligible, existing, connections,
+            str(getattr(agent, "provider", "") or ""))
+        for row in admission_rejects:
+            _note_connection_rejection(agent, (row["route"][0], row["route"][1]),
+                                       registry=runtime.registry)
+        # P1-1 Layer B — switch_model fail-safe: even an admitted candidate
+        # can fail endpoint resolution at switch time; the guard skips it,
+        # records the reason and continues failover (never raises out).
+        executed: Optional[Route] = None
+        guard_rejects: List[Dict[str, Any]] = []
+        if admitted:
+            executed, guard_rejects = activate_admitted_candidate(
+                agent, admitted, primary, existing, connections)
+            for row in guard_rejects:
+                _note_connection_rejection(agent, (row["route"][0], row["route"][1]),
+                                           registry=runtime.registry)
+        rejects = admission_rejects + guard_rejects
+        if executed is None:
+            # Every eligible candidate failed connection admission: the same
+            # deterministic pre-API exhaustion gate the router applies to an
+            # empty pool — never an exception escaping switch_model.
+            decision.why.setdefault("rejected", []).extend(rejects)
+            decision.why["error"] = "NO_ELIGIBLE_MODEL"
+            decision.why["connection_admission"] = {
+                "stage": "candidate-admission", "reason": "connection_unresolved",
+                "rejected": rejects, "routing_continued": False,
+            }
+            _safe_record(decision)
+            raise ValueError(f"NO_ELIGIBLE_MODEL: {decision.why}")
         agent._fallback_chain = [chain_entry_for(route, existing, connections)
-                                 for route in eligible if route != decision.route]
+                                 for route in admitted if route != executed]
         agent._fallback_index = 0
         agent._routing_logical_route = workload.route
-        agent._routing_allowed_routes = set(eligible)
-        if decision.route != primary:
-            entry = chain_entry_for(decision.route, existing, connections)
-            from hermes_cli.fallback_config import resolve_entry_api_key
-            agent.switch_model(decision.model, decision.provider,
-                               api_key=resolve_entry_api_key(entry) or "",
-                               base_url=entry.get("base_url") or "",
-                               api_mode=entry.get("api_mode") or "")
+        # Only admitted routes may carry a mid-turn hop: an unresolved
+        # candidate is skipped deterministically, not retried mid-turn.
+        agent._routing_allowed_routes = set(admitted)
+        if rejects:
+            # Deterministic routing/failover reasons, visible in telemetry
+            # (record_decision + turn_usage's durable row) and in the stashed
+            # decision the rest of the turn consults.
+            decision.why.setdefault("rejected", []).extend(rejects)
+            decision.why["connection_admission"] = {
+                "stage": "candidate-admission", "reason": "connection_unresolved",
+                "rejected": rejects, "routing_continued": True,
+                "selected": list(executed),
+            }
+            if executed != decision.route:
+                from dataclasses import replace
+                decision = replace(decision, provider=executed[0], model=executed[1])
+                agent._routing_decision = decision
+            _safe_record(decision)
         return
     chosen = ModelRouter().select_model(
         agent, {"vision": required.vision, "tool_use": required.tool_use},
-        context_window=required.min_context, user_override=primary if pinned else None,
+        context_window=required.min_context, user_override=pinned,
     )
     if chosen is None:
         raise ValueError("Adaptive routing: no compatible configured route")
     if chosen != primary:
         # Use the same provider resolution and client lifecycle as an explicit
         # model switch; never construct a competing provider client here.
-        entry = next(e for e in agent._fallback_chain
-                     if (e.get("provider"), e.get("model")) == chosen)
-        from hermes_cli.fallback_config import resolve_entry_api_key
-        agent.switch_model(chosen[1], chosen[0],
-                           api_key=resolve_entry_api_key(entry) or "",
-                           base_url=entry.get("base_url") or "",
-                           api_mode=entry.get("api_mode") or "")
+        # P1-1: the same two defensive layers apply on this seam — candidate
+        # connection admission first, then the switch_model fail-safe — so an
+        # unresolvable candidate can never crash the turn here either.
+        legacy_decision = getattr(agent, "_routing_decision", None)
+        if legacy_decision is not None and legacy_decision.route == chosen:
+            legacy_eligible = [c.route for c in legacy_decision.ranked]
+        else:
+            # select_model returned an override without a fresh ranked pool;
+            # only the chosen route itself is a known-fresh candidate.
+            legacy_eligible = []
+        legacy_eligible = legacy_eligible or [(chosen[0], chosen[1])]
+        existing = {(str(e.get("provider") or "").strip().lower(),
+                     str(e.get("model") or "").strip()): e
+                    for e in agent._fallback_chain if isinstance(e, dict)}
+        connections = connection_entries(config)
+        admitted, admission_rejects = admit_candidate_connections(
+            legacy_eligible, existing, connections,
+            str(getattr(agent, "provider", "") or ""))
+        executed = None
+        guard_rejects = []
+        if admitted:
+            executed, guard_rejects = activate_admitted_candidate(
+                agent, admitted, primary, existing, connections)
+        rejects = admission_rejects + guard_rejects
+        for row in rejects:
+            _note_connection_rejection(agent, (row["route"][0], row["route"][1]))
+        if executed is None:
+            reason = {"stage": "candidate-admission",
+                      "reason": "connection_unresolved",
+                      "rejected": rejects, "routing_continued": False}
+            detail = dict(getattr(legacy_decision, "why", {}) or {})
+            detail["error"] = "NO_ELIGIBLE_MODEL"
+            detail["connection_admission"] = reason
+            raise ValueError(f"NO_ELIGIBLE_MODEL: {detail}")
+        if rejects and legacy_decision is not None:
+            legacy_decision.why.setdefault("rejected", []).extend(rejects)
+            legacy_decision.why["connection_admission"] = {
+                "stage": "candidate-admission", "reason": "connection_unresolved",
+                "rejected": rejects, "routing_continued": True,
+                "selected": list(executed),
+            }
+            if executed != legacy_decision.route:
+                from dataclasses import replace
+                legacy_decision = replace(legacy_decision,
+                                          provider=executed[0], model=executed[1])
+                agent._routing_decision = legacy_decision
+            _safe_record(legacy_decision)
 
 
 # -- connection resolution ------------------------------------------
@@ -180,6 +316,188 @@ def chain_entry_for(route: Route, existing: Dict[Route, Dict[str, Any]],
                 entry[target] = conn[source]
     entry["provider"], entry["model"] = route[0], route[1]
     return entry
+
+
+# -- P1-1: candidate connection admission (Layer A) ---------------------
+#
+# A routing candidate whose provider connection cannot be resolved used to
+# survive candidate selection and reach ``switch_model``, which then raised
+# ``ValueError: no base_url resolved ...`` and killed the whole turn
+# (tui_gateway_crash.log:1534). Layer A filters such candidates BEFORE any
+# switch is attempted; Layer B (``activate_admitted_candidate``) is the
+# defense-in-depth guard around the switch itself.
+
+#: Deterministic routing/failover reason for an unexecutable candidate. Reuses
+#: the existing router ``rejected`` row shape (scoring.py) and the existing
+#: failure classification (``FailoverReason.connection_unresolved``) — no
+#: parallel failure framework.
+CONNECTION_UNRESOLVED = "CONNECTION_UNRESOLVED"
+
+# A base_url of exactly "scheme://" (authority missing entirely) can never be
+# a usable endpoint for any client Hermes builds — the transport constructor
+# rejects it before a request is ever attempted.
+_EMPTY_AUTHORITY_URL = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://\s*$")
+
+
+def _usable_base_url(value: Any) -> bool:
+    """True when ``value`` is a structurally usable endpoint string.
+
+    Admission mirrors ``switch_model``'s own resolution bar — a non-empty
+    stripped string. The only extra structural rejection is a bare
+    ``scheme://`` with no authority, which is unconditionally invalid. A
+    present but wrong URL is deliberately NOT judged here: that is an API-time
+    failure the existing retry/failover machinery already owns; admission must
+    never convert unrelated provider errors into admission failures.
+    """
+    if not isinstance(value, str):
+        return False
+    base = value.strip()
+    return bool(base) and not _EMPTY_AUTHORITY_URL.match(base)
+
+
+def admit_candidate_connections(
+    eligible: Sequence[Route],
+    existing: Dict[Route, Dict[str, Any]],
+    connections: Dict[str, Dict[str, Any]],
+    current_provider: str,
+) -> Tuple[List[Route], List[Dict[str, Any]]]:
+    """Layer A — split the ranked eligible routes into admitted + rejected.
+
+    A candidate is admitted when ``switch_model`` could actually activate it:
+
+    * same-provider re-select keeps the established endpoint;
+    * the candidate's chain entry carries a usable ``base_url``;
+    * the provider has a configured connection with a usable ``base_url``;
+    * the provider resolves its canonical endpoint itself (``openai``).
+
+    Anything else — a missing provider connection, a missing/empty/blank
+    ``base_url``, or a structurally unusable endpoint — is rejected with the
+    deterministic ``CONNECTION_UNRESOLVED`` reason before provider execution:
+    it cannot become the active model, cannot crash the turn, and routing
+    continues with the next admitted candidate in rank order.
+    """
+    current = str(current_provider or "").strip().lower()
+    admitted: List[Route] = []
+    rejected: List[Dict[str, Any]] = []
+    for raw_route in eligible:
+        pair: Tuple[str, ...] = (tuple(raw_route) if isinstance(raw_route, (tuple, list))
+                                 and len(raw_route) >= 2 else ("", ""))
+        route: Route = (pair[0], pair[1])
+        provider = str(route[0] or "").strip().lower()
+        row = {"route": [route[0], route[1]], "reason": CONNECTION_UNRESOLVED,
+               "stage": "connection_admission"}
+        if not provider:
+            rejected.append(row)
+            continue
+        if provider == current:
+            admitted.append(route)
+            continue
+        entry = existing.get(route) or {}
+        if _usable_base_url(entry.get("base_url")):
+            admitted.append(route)
+            continue
+        conn = connections.get(provider) or {}
+        if _usable_base_url(conn.get("base_url")):
+            admitted.append(route)
+            continue
+        if provider == "openai":
+            # switch_model resolves the canonical OpenAI endpoint itself
+            # (agent_runtime_helpers._resolve_switch_destination).
+            admitted.append(route)
+            continue
+        if _is_first_class_provider(provider):
+            # First-class providers (lmstudio, nous, openai-codex, xai-oauth, ...)
+            # resolve their own canonical endpoint via hermes_cli.auth /
+            # runtime_provider — independent of the generic `providers:`
+            # custom-connection config this function otherwise checks. A
+            # registry.json route for one of these (e.g. a local LM Studio
+            # model) has no matching `providers:` entry by design, so without
+            # this it would be rejected as connection_unresolved even while
+            # the local server is running and perfectly reachable (#lmstudio
+            # registry/config mismatch).
+            admitted.append(route)
+            continue
+        rejected.append(row)
+    return admitted, rejected
+
+
+def _is_first_class_provider(provider: str) -> bool:
+    """True for a provider hermes_cli.auth can build a client for on its own
+    (OAuth or well-known local runtime), with no ``providers:`` config entry."""
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        return provider in PROVIDER_REGISTRY
+    except Exception:
+        return False
+
+
+def activate_admitted_candidate(
+    agent: Any,
+    admitted: Sequence[Route],
+    primary: Optional[Route],
+    existing: Dict[Route, Dict[str, Any]],
+    connections: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[Route], List[Dict[str, Any]]]:
+    """Layer B — execute the first admitted candidate under the switch fail-safe.
+
+    Walks the admitted candidates in rank order and switches through the
+    canonical ``agent.switch_model`` lifecycle. A candidate whose switch
+    raises :class:`SwitchEndpointUnresolvedError` — possible even after
+    admission, e.g. a config edit racing the turn — is skipped, its reason
+    recorded deterministically, and the walk continues with the next
+    candidate: ``SKIP candidate -> record reason -> continue failover``. Any
+    other exception propagates untouched: the guard must not hide programming
+    errors, corrupt state or unrelated provider failures.
+
+    Returns ``(executed_route, guard_rejects)``; ``executed_route`` is None
+    when no candidate could be activated (the caller applies the existing
+    deterministic ``NO_ELIGIBLE_MODEL`` exhaustion semantics).
+    """
+    from agent.agent_runtime_helpers import SwitchEndpointUnresolvedError
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    executed: Optional[Route] = None
+    guard_rejects: List[Dict[str, Any]] = []
+    for route in admitted:
+        if primary is not None and route == primary:
+            executed = route  # already the live runtime; no switch needed
+            break
+        entry = chain_entry_for(route, existing, connections)
+        try:
+            agent.switch_model(route[1], route[0],
+                               api_key=resolve_entry_api_key(entry) or "",
+                               base_url=entry.get("base_url") or "",
+                               api_mode=entry.get("api_mode") or "")
+        except SwitchEndpointUnresolvedError as exc:
+            guard_rejects.append({"route": [route[0], route[1]],
+                                  "reason": CONNECTION_UNRESOLVED,
+                                  "stage": "switch_model_guard", "detail": str(exc)})
+            continue
+        executed = route
+        break
+    return executed, guard_rejects
+
+
+def _note_connection_rejection(agent: Any, route: Route,
+                               *, registry: Optional[RouteRegistry] = None) -> None:
+    """Record one connection-admission rejection through the existing node-D
+    health + node-I telemetry seams (deterministic reason, provider/model
+    labels only — never credentials). Best-effort: never raises, never breaks
+    a turn."""
+    try:
+        from agent.error_classifier import FailoverReason
+        from agent.routing import health as _health
+        from agent.routing import telemetry as _tele
+
+        reg = registry or getattr(getattr(agent, "_routing_runtime", None),
+                                  "registry", None) or _default_registry
+        reg.get(route[0], route[1])  # materialise so health can attach
+        hd = _health.apply_failure(route[0], route[1],
+                                   FailoverReason.connection_unresolved,
+                                   registry=reg)
+        _tele.record_health(hd)
+    except Exception:  # pragma: no cover - telemetry must never break a turn
+        _LOG.debug("connection admission rejection not recorded", exc_info=True)
 
 
 # -- pool helpers -------------------------------------------------------

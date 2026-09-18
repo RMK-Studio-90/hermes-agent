@@ -61,6 +61,13 @@ HEALTH_POLICY: Dict[FailoverReason, HealthAction] = {
     FailoverReason.auth: HealthAction("exclude", ttl_seconds=1800),
     FailoverReason.ssl_cert_verification: HealthAction("exclude", ttl_seconds=1800),
     FailoverReason.provider_policy_blocked: HealthAction("exclude", ttl_seconds=600),
+    # P1-1: routing-candidate admission — the provider connection/endpoint could
+    # not be resolved (missing connection, empty base_url, structurally
+    # unusable endpoint). Deterministic config-shaped defect, not a transient
+    # provider fault: exclude briefly so the router stops re-ranking a candidate
+    # the runtime cannot execute, and let the TTL re-admit it once the operator
+    # repairs the configuration.
+    FailoverReason.connection_unresolved: HealthAction("exclude", ttl_seconds=600),
     # Unclassifiable — mild deprioritise, escalate if it keeps happening.
     FailoverReason.unknown: HealthAction("degrade", ttl_seconds=60,
                                          escalate_after=4, escalate_ttl=300),
@@ -132,7 +139,31 @@ def apply_failure(
         ttl = action.escalate_ttl or action.ttl_seconds
         escalated = True
 
+    # Update the specific route that failed
     reg.update_health(provider, model, status, reason=reason.value, ttl_seconds=ttl)
+
+    # Billing failures ("insufficient_quota"-shaped) are usually account-wide, so
+    # they should also exclude *other routes on the same account/credential* —
+    # but never merely "the same provider string". A bare provider match is not
+    # evidence of a shared account: providers can (and do) carry multiple
+    # independent accounts/credentials, and treating every model behind a
+    # provider label as one blast radius would poison unrelated, healthy
+    # models/accounts on a single billing failure (the exact anti-pattern this
+    # policy must avoid). ``connection_id`` is the only positive account-identity
+    # signal the registry carries; propagate only to routes proven to share it.
+    # No connection_id on the failed route -> no finer identity is available ->
+    # the exclusion stays scoped to the one route that actually failed.
+    if reason == FailoverReason.billing:
+        failed_entry = reg.get(provider, model)
+        conn_id = failed_entry.connection_id if failed_entry else None
+        if conn_id:
+            for prov, mod in reg.known_routes():
+                if (prov, mod) == (provider, model):
+                    continue
+                sibling = reg.get(prov, mod)
+                if sibling is not None and sibling.connection_id == conn_id:
+                    reg.update_health(prov, mod, HealthStatus.EXCLUDED, reason=reason.value, ttl_seconds=ttl)
+
     return HealthDecision(
         provider=provider,
         model=model,

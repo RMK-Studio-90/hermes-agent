@@ -111,6 +111,41 @@ def test_unresolved_route_reports_unresolved(reg: RouteRegistry) -> None:
     assert d.action == "unresolved"
 
 
+# -- billing account-wide propagation: connection_id, never bare provider ----
+
+def test_billing_excludes_sibling_route_with_same_connection_id() -> None:
+    r = RouteRegistry(allow_network=False)
+    r.register("p", "a", capabilities=_caps(), cost_input=0.0, cost_output=0.0).connection_id = "acct-1"
+    r.register("p", "b", capabilities=_caps(), cost_input=0.0, cost_output=0.0).connection_id = "acct-1"
+    apply_failure("p", "a", FailoverReason.billing, registry=r)
+    assert r.get("p", "a").is_available() is False
+    # Same account (same connection_id) as the failed route -> also excluded.
+    assert r.get("p", "b").is_available() is False
+
+
+def test_billing_does_not_poison_sibling_with_different_connection_id() -> None:
+    r = RouteRegistry(allow_network=False)
+    r.register("p", "a", capabilities=_caps(), cost_input=0.0, cost_output=0.0).connection_id = "acct-1"
+    r.register("p", "b", capabilities=_caps(), cost_input=0.0, cost_output=0.0).connection_id = "acct-2"
+    apply_failure("p", "a", FailoverReason.billing, registry=r)
+    assert r.get("p", "a").is_available() is False
+    # Different account on the SAME provider string -> must stay healthy
+    # (multi-account provider isolation; a bare provider match is not
+    # evidence of a shared account).
+    assert r.get("p", "b").is_available() is True
+
+
+def test_billing_stays_model_scoped_without_connection_id(reg: RouteRegistry) -> None:
+    # No connection_id anywhere (legacy/ad-hoc registration): no finer account
+    # identity is available, so the exclusion must NOT broaden to other
+    # models under the same provider string -- that would poison unrelated,
+    # healthy models on one billing failure.
+    reg.register("p", "sibling", capabilities=_caps(), cost_input=0.0, cost_output=0.0)
+    apply_failure("p", "m", _ce(FailoverReason.billing), registry=reg)
+    assert reg.get("p", "m").is_available() is False
+    assert reg.get("p", "sibling").is_available() is True
+
+
 # -- pure lookup -----------------------------------------------------
 
 def test_action_for_accepts_bare_reason() -> None:
