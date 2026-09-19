@@ -9,9 +9,7 @@
   ],
   "date": "2026-09-19",
   "git": {
-    "branch": "rmk/integration-current-upstream",
-    "dirty": false,
-    "head": "b5aa7b1c04c425048126506774d9a44cb01ae4a9"
+    "branch": "rmk/integration-current-upstream"
   },
   "priorities": [
     {
