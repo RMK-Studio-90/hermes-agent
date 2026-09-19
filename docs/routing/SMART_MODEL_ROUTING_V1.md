@@ -89,9 +89,39 @@ override remains available (`--route`, `agent._routing_logical_route`,
 | `rmk-vision` | any turn carrying images | forces `vision` | rows listing `rmk-vision` | as above **+ missing vision** | priority desc, latency asc | same | same |
 
 Ranking is lexicographic and health-first in every route: effective health, then
-recency-decayed historical success rate, then the route-specific preference
-above, then a deterministic `(model_id, provider)` tie-break. Identical inputs
-always produce an identical order.
+**billing tier**, then recency-decayed historical success rate, then the
+route-specific preference above, then a deterministic `(model_id, provider)`
+tie-break. Identical inputs always produce an identical order. The effective
+precedence is:
+
+1. capability / task requirements (hard filter)
+2. availability (hard filter; disabled, unavailable, excluded-health)
+3. health (HEALTHY before DEGRADED)
+4. billing tier: `free`/`local` (one tier) > `subscription` > unknown-cost > `METERED_PAID`
+5. historical reliability, *inside* the billing tier
+6. route preference (priority / latency / context / coding score ...), then tie-break
+
+Billing precedes reliability so a subscription route's good track record can
+never lift it over a capable free/local route (RMK policy: capable local/free ->
+subscription fallback -> metered only with approval). Reliability still orders
+routes strongly, but only within one tier. Metered routes remain behind the
+zero-paid hard gate and its approval state; this ordering never admits them.
+
+**`rmk-fast` is the documented exception.** It is the latency-specialised
+route, so it keeps its own order (health, reliability, latency asc, priority
+desc) and is exempt from the billing tier: a faster subscription route can lead
+a slower free one there. This is intentional and pinned by
+`tests/agent/routing/test_billing_precedence.py::test_rmk_fast_keeps_latency_before_priority`.
+Anything that must stay free-first should not be routed as `rmk-fast`.
+
+Local providers (loopback endpoints such as LM Studio) are additionally guarded
+at candidate admission: a loopback endpoint that refuses connections is skipped
+after one bounded TCP probe (0.25 s, cached 10 s) and excluded through the
+normal health machinery for 30 s (`local_endpoint_unreachable`, half-open
+re-probe afterwards); the registry's `available` flag is never rewritten. The
+endpoint comes from `providers.<name>.base_url` (LM Studio:
+`providers.lmstudio.base_url: http://127.0.0.1:1234/v1`), else the provider's
+`LM_BASE_URL` override or canonical default.
 
 ## FREE_FIRST_POLICY / zero-paid hard gate
 
@@ -188,11 +218,12 @@ activity. No SQLite access is needed to inspect routing.
 
 ## KNOWN_BEHAVIOURS / RISKS
 
-* **Reliability precedes the route preference.** Ranking is health → recency-decayed historical success → route-specific preference. A candidate with proven successes (success rate 1.0) therefore outranks an unproven one (neutral prior 0.5) even on `rmk-fast`, where the unproven model advertises lower latency. This is Astra's documented design (`scoring.py`) and is deliberate — an unproven model should not win on a self-declared number — but it means a freshly added "fast" model needs some successful turns before it wins its own route. Observable in `rmk-router explain --route rmk-fast`.
+* **Billing tier precedes reliability, reliability precedes the route preference.** Ranking is health → billing tier → recency-decayed historical success → route-specific preference. Inside a tier a candidate with proven successes (success rate 1.0) outranks an unproven one (neutral prior 0.5) even where the unproven model advertises lower latency — an unproven model should not win on a self-declared number — so a freshly added "fast" model needs some successful turns before it wins its own route. Across tiers history never overrides billing (a 0.89 subscription route does not outrank a 0.54 capable free one). `rmk-fast` keeps the pre-billing order (see above). Observable in `rmk-router explain --route rmk-fast`.
+* **Within the free/local tier a weak route still leads the subscription.** A free route with a poor record (e.g. `oc/big-pickle`, 0.0 over a few outcomes) is tried before any subscription route until failures move it to DEGRADED/EXCLUDED through health; that is the policy trade-off, not a bug.
 * **`available: false` is a hard gate, not health.** The two Codex rows will not be re-admitted automatically when the quota window resets; an operator (or the future Control Plane) flips the flag.
 * **Registry accuracy is a human/Control-Plane responsibility.** Admission validates shape and internal consistency, not truthfulness: a wrong `billing_class` in the file is a wrong policy. The `-high` effort variants are the cautionary case — the provider catalog advertised models that do not execute.
 * **The classifier is keyword-based**, deliberately conservative and offline. Unusual phrasing falls back to `rmk-general`, which is safe (general candidates are a superset in the current registry) but not always optimal. `--route` / `agent._routing_logical_route` remains the explicit escape hatch.
-* **LM Studio (`127.0.0.1:1234`) was down** during validation and is not exposed through OmniRoute, so no local zero-cost model is in the registry. Local models are the natural resilience layer if every subscription quota is exhausted simultaneously; adding one is a registry edit once LM Studio is running.
+* **LM Studio (`127.0.0.1:1234`)** is configured as `providers.lmstudio.base_url` and its models are registry rows (`cost_kind: local`, `rmk-general` only). Local models share the zero-cost tier with free cloud routes. While the server is offline they are skipped at admission (see above) and free cloud carries the turn; nothing waits on an offline local model. `scripts/sync_lmstudio_registry.py` still reconciles the *catalogue* (`available`) when the server is reachable.
 
 ## Interface for the deferred Free Model Control Plane
 

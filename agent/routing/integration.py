@@ -22,9 +22,14 @@ Integration points
 from __future__ import annotations
 
 import logging
+import os
 import re
+import socket
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from agent.routing._flags import adaptive_routing_enabled
 from agent.routing.capabilities import RequiredCapabilities, classify_task
@@ -172,7 +177,7 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
             str(getattr(agent, "provider", "") or ""))
         for row in admission_rejects:
             _note_connection_rejection(agent, (row["route"][0], row["route"][1]),
-                                       registry=runtime.registry)
+                                       registry=runtime.registry, reason=row["reason"])
         # P1-1 Layer B — switch_model fail-safe: even an admitted candidate
         # can fail endpoint resolution at switch time; the guard skips it,
         # records the reason and continues failover (never raises out).
@@ -254,7 +259,8 @@ def prepare_turn_route(agent: Any, user_message: Any, conversation_history: Any)
                 agent, admitted, primary, existing, connections)
         rejects = admission_rejects + guard_rejects
         for row in rejects:
-            _note_connection_rejection(agent, (row["route"][0], row["route"][1]))
+            _note_connection_rejection(agent, (row["route"][0], row["route"][1]),
+                                       reason=row["reason"])
         if executed is None:
             reason = {"stage": "candidate-admission",
                       "reason": "connection_unresolved",
@@ -356,6 +362,92 @@ def _usable_base_url(value: Any) -> bool:
     return bool(base) and not _EMPTY_AUTHORITY_URL.match(base)
 
 
+# -- local availability protection ---------------------------------------
+#
+# Local-first must never turn into "wait for an offline local model on every
+# request". A loopback endpoint that is not accepting connections is skipped at
+# admission after one bounded TCP probe; the verdict is cached so a dead server
+# costs at most one probe per ``LOCAL_PROBE_DOWN_TTL_SECONDS`` and never a retry
+# loop. Only loopback hosts are probed: a remote endpoint's reachability stays
+# the business of the normal API-time retry/failover machinery.
+
+#: Deterministic rejection reason for a loopback provider that refuses connections.
+LOCAL_ENDPOINT_UNREACHABLE = "LOCAL_ENDPOINT_UNREACHABLE"
+# A live loopback server accepts in ~1 ms; a refused connect on Windows only
+# resolves at the timeout, so this bounds the cost of an offline server.
+LOCAL_PROBE_TIMEOUT_SECONDS = 0.25
+LOCAL_PROBE_UP_TTL_SECONDS = 15.0
+LOCAL_PROBE_DOWN_TTL_SECONDS = 10.0
+#: Health TTL of an unreachable local route: short, so a server the operator
+#: starts a moment later is re-admitted (half-open) without a manual reset.
+LOCAL_EXCLUDE_TTL_SECONDS = 30.0
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+_probe_lock = threading.Lock()
+_probe_cache: Dict[Tuple[str, int], Tuple[float, bool]] = {}
+
+
+def _probe_clock() -> float:
+    return time.monotonic()
+
+
+def reset_local_probe_cache() -> None:
+    with _probe_lock:
+        _probe_cache.clear()
+
+
+def _tcp_reachable(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _endpoint_url(provider: str, entry: Dict[str, Any], conn: Dict[str, Any]) -> str:
+    """Endpoint the runtime would use for ``provider``: chain entry, configured
+    connection, then a first-class provider's env override / canonical default."""
+    for source in (entry.get("base_url"), conn.get("base_url")):
+        if isinstance(source, str) and source.strip():
+            return source.strip()
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        pconfig = PROVIDER_REGISTRY.get(provider)
+    except Exception:
+        pconfig = None
+    if pconfig is None:
+        return ""
+    override = os.environ.get(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    return override or pconfig.inference_base_url or ""
+
+
+def local_endpoint_down(base_url: str) -> bool:
+    """True only for a loopback endpoint that refuses connections right now.
+
+    Non-loopback and unparseable URLs are never judged (False). The verdict is
+    cached per ``(host, port)``.
+    """
+    try:
+        parts = urlsplit(base_url)
+        host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not host or host.lower() not in _LOOPBACK_HOSTS:
+        return False
+    key = (host.lower(), port)
+    now = _probe_clock()
+    with _probe_lock:
+        hit = _probe_cache.get(key)
+    if hit is not None:
+        stamped, up = hit
+        if now - stamped < (LOCAL_PROBE_UP_TTL_SECONDS if up else LOCAL_PROBE_DOWN_TTL_SECONDS):
+            return not up
+    up = _tcp_reachable(host, port, LOCAL_PROBE_TIMEOUT_SECONDS)
+    with _probe_lock:
+        _probe_cache[key] = (now, up)
+    return not up
+
+
 def admit_candidate_connections(
     eligible: Sequence[Route],
     existing: Dict[Route, Dict[str, Any]],
@@ -390,10 +482,17 @@ def admit_candidate_connections(
         if not provider:
             rejected.append(row)
             continue
+        entry = existing.get(route) or {}
+        # Local availability protection runs before every admit branch, the
+        # same-provider one included: an agent already on a dead local server
+        # gains nothing from staying there.
+        if local_endpoint_down(_endpoint_url(provider, entry, connections.get(provider) or {})):
+            rejected.append({"route": [route[0], route[1]], "reason": LOCAL_ENDPOINT_UNREACHABLE,
+                             "stage": "local_availability"})
+            continue
         if provider == current:
             admitted.append(route)
             continue
-        entry = existing.get(route) or {}
         if _usable_base_url(entry.get("base_url")):
             admitted.append(route)
             continue
@@ -480,7 +579,8 @@ def activate_admitted_candidate(
 
 
 def _note_connection_rejection(agent: Any, route: Route,
-                               *, registry: Optional[RouteRegistry] = None) -> None:
+                               *, registry: Optional[RouteRegistry] = None,
+                               reason: str = CONNECTION_UNRESOLVED) -> None:
     """Record one connection-admission rejection through the existing node-D
     health + node-I telemetry seams (deterministic reason, provider/model
     labels only — never credentials). Best-effort: never raises, never breaks
@@ -489,13 +589,27 @@ def _note_connection_rejection(agent: Any, route: Route,
         from agent.error_classifier import FailoverReason
         from agent.routing import health as _health
         from agent.routing import telemetry as _tele
+        from agent.routing.registry import HealthStatus
 
         reg = registry or getattr(getattr(agent, "_routing_runtime", None),
                                   "registry", None) or _default_registry
         reg.get(route[0], route[1])  # materialise so health can attach
-        hd = _health.apply_failure(route[0], route[1],
-                                   FailoverReason.connection_unresolved,
-                                   registry=reg)
+        if reason == LOCAL_ENDPOINT_UNREACHABLE:
+            # A stopped local server is an operational state, not a config
+            # defect: exclude briefly (half-open re-probe after the TTL) and
+            # leave the registry's ``available`` metadata untouched.
+            consecutive = reg.note_failure(route[0], route[1])
+            reg.update_health(route[0], route[1], HealthStatus.EXCLUDED,
+                              reason="local_endpoint_unreachable",
+                              ttl_seconds=LOCAL_EXCLUDE_TTL_SECONDS)
+            hd = _health.HealthDecision(
+                provider=route[0], model=route[1], reason="local_endpoint_unreachable",
+                action="exclude", new_status=HealthStatus.EXCLUDED.value,
+                ttl_seconds=LOCAL_EXCLUDE_TTL_SECONDS, consecutive_failures=consecutive)
+        else:
+            hd = _health.apply_failure(route[0], route[1],
+                                       FailoverReason.connection_unresolved,
+                                       registry=reg)
         _tele.record_health(hd)
     except Exception:  # pragma: no cover - telemetry must never break a turn
         _LOG.debug("connection admission rejection not recorded", exc_info=True)

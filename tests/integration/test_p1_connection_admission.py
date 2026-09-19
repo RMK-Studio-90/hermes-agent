@@ -38,6 +38,17 @@ from agent.routing import _flags, integration, telemetry
 from agent.routing import registry as registry_mod
 from agent.routing.health import action_for
 from agent.routing.override import Override, OverrideMode, allows_fallback
+
+
+@pytest.fixture(autouse=True)
+def _loopback_endpoints_reachable(monkeypatch):
+    """This suite is about connection *resolution*. Whether a loopback endpoint
+    (e.g. a real LM Studio at 127.0.0.1:1234) is up must not decide its outcome;
+    reachability is covered by test_routing_local_availability.py."""
+    integration.reset_local_probe_cache()
+    monkeypatch.setattr(integration, "_tcp_reachable", lambda host, port, timeout: True)
+    yield
+    integration.reset_local_probe_cache()
 from agent.routing.registry import HealthStatus
 
 BROKEN = ("broken", "alpha-broken")     # provider without any configured connection

@@ -33,7 +33,9 @@ REQ = RequiredCapabilities(tool_use=True, min_context=8000)
 
 # -- Free-First -------------------------------------------------------------
 
-def test_reliability_precedes_cost(tmp_path) -> None:
+def test_billing_class_precedes_reliability(tmp_path) -> None:
+    """Free-first is a policy, not a tie-break: a paid route's track record must
+    not outrank a capable free route (was ``test_reliability_precedes_cost``)."""
     h = RoutingHistory(db_path=tmp_path / "h.db")
     now = time.time()
     for _ in range(20):
@@ -42,9 +44,24 @@ def test_reliability_precedes_cost(tmp_path) -> None:
         [_entry("paid", "gpt", tier="paid", cost_in=3, cost_out=6), _entry("free", "llama", tier="free")],
         REQ, history=h, now_epoch=now,
     )
-    assert res.best.route == ("paid", "gpt")
+    assert res.best.route == ("free", "llama")
     assert res.free_available is True
-    assert res.requires_paid is True
+    assert res.requires_paid is False
+    h.close()
+
+
+def test_reliability_precedes_cost_within_a_billing_tier(tmp_path) -> None:
+    h = RoutingHistory(db_path=tmp_path / "h.db")
+    now = time.time()
+    for _ in range(20):
+        h.record("paid", "pricey", REQ.cap_class(), ok=True, latency_ms=10.0, ts=now)
+        h.record("paid", "cheap", REQ.cap_class(), ok=False, ts=now)
+    res = rank_candidates(
+        [_entry("paid", "cheap", tier="paid", cost_in=1, cost_out=2),
+         _entry("paid", "pricey", tier="paid", cost_in=10, cost_out=20)],
+        REQ, history=h, now_epoch=now,
+    )
+    assert res.best.route == ("paid", "pricey")
     h.close()
 
 

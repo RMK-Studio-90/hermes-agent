@@ -3,16 +3,24 @@
 Turns a set of :class:`~agent.routing.registry.ModelEntry` into a ranked list for
 a given :class:`~agent.routing.capabilities.RequiredCapabilities`.
 
-The pipeline is lexicographic: reliability precedes cost, and Free-First breaks
-ties among equally reliable compatible routes:
+The pipeline is lexicographic. RMK policy is *capable local/free first ->
+subscription fallback -> metered only with approval*, so the billing class
+precedes historical reliability; reliability still orders routes strongly, but
+only inside one billing tier:
 
     1. CAPABILITY   hard filter — a model that cannot do the task is dropped
     2. AVAILABILITY hard filter — an EXCLUDED (and un-expired) route is dropped
-    3. RELIABILITY  effective health, then recency-decayed historical success
-    4. FREE_FIRST   free > unknown-cost > paid
-    5. COST         cheaper $/Mtok wins
-    6. LATENCY      lower historical p50 wins (unknown sorts last)
-    7. TIE-BREAK    model_id, then provider  (stable, arbitrary but reproducible)
+    3. HEALTH       HEALTHY before DEGRADED (a transiently failing route yields)
+    4. BILLING      local/free > subscription > unknown-cost > metered paid
+    5. RELIABILITY  recency-decayed historical success, inside the billing tier
+    6. COST         cheaper $/Mtok wins
+    7. LATENCY      lower historical p50 wins (unknown sorts last)
+    8. TIE-BREAK    model_id, then provider  (stable, arbitrary but reproducible)
+
+Logical routes replace 6-7 by their own preference (priority / latency / ...),
+except ``rmk-fast``, the documented latency-specialised route, which keeps its
+historical order (health, reliability, latency, priority) and is exempt from
+the billing tier — see docs/routing/SMART_MODEL_ROUTING_V1.md.
 
 If no *free* model can do the task the result is still returned, with
 ``requires_paid=True`` — the caller (router / override) decides whether to use a
@@ -36,6 +44,26 @@ _LONG_OUTPUT_FLOOR = 4_096
 _TIER_RANK = {"free": 2, "unknown": 1, "paid": 0}
 _HEALTH_RANK = {HealthStatus.HEALTHY: 2, HealthStatus.DEGRADED: 1, HealthStatus.EXCLUDED: 0}
 
+# Billing precedence (higher ranks first). ``local`` and ``free`` are one tier:
+# neither draws on a quota or a bill. ``subscription`` is zero *additional* cost
+# but spends a shared allowance, so it is the fallback. Everything else keeps the
+# legacy cost-tier order (unknown-cost before metered), never above the two.
+_BILLING_RANK = {"free": 3, "local": 3, "subscription": 2, "unknown": 1, "paid": 0}
+
+# The one logical route whose contract is "latency asc, then priority desc": it
+# keeps its own order instead of the billing tier (see module docstring).
+_LATENCY_SPECIALISED_ROUTES = frozenset({"rmk-fast"})
+
+
+def _billing_rank(entry: ModelEntry) -> int:
+    """Billing tier of a route: local/free 3, subscription 2, unknown 1, metered 0."""
+    if entry.billing_class == "METERED_PAID":
+        return _BILLING_RANK["paid"]
+    # An explicit registry ``cost_kind`` wins; entries materialised from models.dev
+    # or ``register()`` carry no kind ("unknown") and fall back to the derived tier.
+    kind = entry.cost_kind if entry.cost_kind != "unknown" else entry.cost_tier
+    return _BILLING_RANK.get(kind, _BILLING_RANK["unknown"])
+
 
 @dataclass(frozen=True)
 class ScoreBreakdown:
@@ -43,6 +71,7 @@ class ScoreBreakdown:
 
     cost_tier: str
     tier_rank: int
+    billing_rank: int
     health: str
     health_rank: int
     success_rate: float
@@ -134,6 +163,7 @@ def score_candidate(
     stats = _stats_for(entry, req, history, half_life_seconds, now_epoch, aggregate_history)
     eff_health = entry.effective_status(now)
     tier_rank = _TIER_RANK.get(entry.cost_tier, 1)
+    billing_rank = _billing_rank(entry)
     health_rank = _HEALTH_RANK.get(eff_health, 0)
     cost = round((entry.cost_input or 0.0) + (entry.cost_output or 0.0), 6)
     # Round the success rate so float noise never outranks a real difference.
@@ -142,8 +172,8 @@ def score_candidate(
 
     sort_key = (
         -health_rank,        # healthy before degraded
-        -sr,                 # higher historical success first
-        -tier_rank,          # free first among equally reliable candidates
+        -billing_rank,       # local/free > subscription > unknown > metered
+        -sr,                 # higher historical success first, inside the tier
         cost,                # cheaper first
         latency_sort,        # faster first, unknown last
         entry.model_id,      # deterministic tie-break
@@ -152,6 +182,7 @@ def score_candidate(
     breakdown = ScoreBreakdown(
         cost_tier=entry.cost_tier,
         tier_rank=tier_rank,
+        billing_rank=billing_rank,
         health=eff_health.value,
         health_rank=health_rank,
         success_rate=sr,
@@ -223,8 +254,12 @@ def rank_candidates(
                 "rmk-research": (-entry.capabilities.context_window, -entry.research, -entry.priority, latency),
                 "rmk-vision": (-entry.priority, latency),
             }[logical_route]
-            cand.sort_key = (-b.health_rank, -b.success_rate, *preference,
-                             entry.model_id, entry.provider)
+            if logical_route in _LATENCY_SPECIALISED_ROUTES:
+                cand.sort_key = (-b.health_rank, -b.success_rate, *preference,
+                                 entry.model_id, entry.provider)
+            else:
+                cand.sort_key = (-b.health_rank, -b.billing_rank, -b.success_rate,
+                                 *preference, entry.model_id, entry.provider)
         result.ranked.append(cand)
 
     result.ranked.sort(key=lambda c: c.sort_key)

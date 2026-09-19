@@ -33,8 +33,14 @@ def test_lmstudio_is_first_class_provider():
     assert integration._is_first_class_provider("lmstudio") is True
 
 
-def test_lmstudio_connection_admits_without_custom_config():
-    """LM Studio resolves its own endpoint; it needs no `providers:` entry."""
+def test_lmstudio_connection_admits_without_custom_config(monkeypatch):
+    """LM Studio resolves its own endpoint; it needs no `providers:` entry.
+
+    Connection *resolution* only: whether the server is actually up is decided
+    by the local availability probe (test_routing_local_availability.py), so the
+    probe is pinned reachable here and the test does not depend on a live server."""
+    integration.reset_local_probe_cache()
+    monkeypatch.setattr(integration, "_tcp_reachable", lambda host, port, timeout: True)
     admitted, rejected = integration.admit_candidate_connections(
         [("lmstudio", "qwen/qwen3-coder-30b")], {}, {}, "none",
     )
