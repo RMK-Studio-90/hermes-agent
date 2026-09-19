@@ -1,0 +1,76 @@
+{
+  "blockers": [
+    {
+      "goal": "Fix OpenViking model-routing config (provider/model prefix for 'free-stack') so viking_search succeeds again; re-verify with one live query.",
+      "id": "obsidian-openviking-integration",
+      "name": "Obsidian / OpenViking Integration",
+      "why": "viking_search currently fails with HTTP 400 'Unable to determine provider for model free-stack' — a model-routing config error blocking Hermes memory search."
+    }
+  ],
+  "date": "2026-09-19",
+  "git": {
+    "branch": "rmk/integration-current-upstream",
+    "dirty": true,
+    "head": "d20dbc678afa05478a49b44f51ca888cd9558d53"
+  },
+  "priorities": [
+    {
+      "confidence": "high",
+      "goal": "Fix OpenViking model-routing config (provider/model prefix for 'free-stack') so viking_search succeeds again; re-verify with one live query.",
+      "id": "obsidian-openviking-integration",
+      "name": "Obsidian / OpenViking Integration",
+      "state": "BLOCKED",
+      "tier": "P1",
+      "why": "viking_search currently fails with HTTP 400 'Unable to determine provider for model free-stack' — a model-routing config error blocking Hermes memory search."
+    },
+    {
+      "confidence": "medium",
+      "goal": "Verify Telegram/Discord/n8n notification delivery end-to-end for the X-Watcher pilot and mark production-accepted.",
+      "id": "x-monitor",
+      "name": "X-Watcher / X-Monitor Notifications",
+      "state": "ACTIVE",
+      "tier": "P2",
+      "why": "Pilot running since 2026-09-04; baseline classification 47/48 posts complete (98%). Remaining work is notification delivery (Telegram/Discord/n8n), not core classification."
+    },
+    {
+      "confidence": "medium",
+      "goal": "Define and implement the next concrete production milestone for the graph engineering pipeline.",
+      "id": "graph-engineering",
+      "name": "Graph Engineering",
+      "state": "ACTIVE",
+      "tier": "P3",
+      "why": "Actively used tooling (graphengineering-auftrag skill used this very session); strategic building block for future agent workflows."
+    }
+  ],
+  "projects": {
+    "active": [
+      "github-releases",
+      "graph-engineering",
+      "mission-control",
+      "n8n-workflows",
+      "rmk-ai-studio",
+      "telegram-integration",
+      "x-monitor"
+    ],
+    "blocked": [
+      "obsidian-openviking-integration"
+    ],
+    "paused": [
+      "second-brain"
+    ]
+  },
+  "schema_version": 1,
+  "systems": {
+    "daily_priority_engine": {
+      "state": "PRODUCTION"
+    },
+    "daily_snapshot": {
+      "state": "PRODUCTION"
+    },
+    "smart_model_routing": {
+      "eligible_models": 21,
+      "state": "PRODUCTION",
+      "unhealthy_or_disabled": 3
+    }
+  }
+}

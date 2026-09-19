@@ -48,6 +48,9 @@
           verification found a staged path outside the allowlist
           (defense in depth; should not normally trigger); aborted
           before commit
+      9 = SNAPSHOT_BLOCKED_STATE_GENERATION_FAILED - state/daily/hermes-state.json
+          generation exited non-zero; aborted before staging, no stale
+          state file was snapshotted as if it were current
       1 = Unexpected/other error
 #>
 
@@ -90,6 +93,7 @@ $AllowlistExactPaths = @(
     'tools/rmk-daily-git-snapshot.ps1'
     'tools/install-rmk-daily-git-snapshot.ps1'
     '.github/workflows/rmk-daily-snapshot-health-check.yml'
+    'state/daily/hermes-state.json'
 )
 
 # Protected Smart Model Routing surface - if anything here is dirty, the
@@ -222,27 +226,23 @@ try {
     }
 
     # -----------------------------------------------------------------
-    # 1a. Regenerate docs/rmk/HERMES_DAILY_STATUS.md (allowlisted, dynamic
+    # 1a. Regenerate state/daily/hermes-state.json (allowlisted, dynamic
     #     daily-state artifact) before status is captured below, so a fresh
     #     write is picked up by the same porcelain scan the rest of this run
-    #     evaluates. Best-effort only: this is content generation, not a
-    #     safety guard, so a failure here is logged and the run continues
-    #     with whatever the file already contained (or without it).
+    #     evaluates. FAIL CLOSED: unlike content generation, this is treated
+    #     as a safety-relevant step - a non-zero exit here aborts the whole
+    #     snapshot run so a stale/missing state file is never staged as if
+    #     it were current.
     # -----------------------------------------------------------------
-    $statusGenScript = Join-Path $RepoPath 'tools\rmk-daily-status.ps1'
-    if (Test-Path -LiteralPath $statusGenScript) {
-        try {
-            $statusOut = & powershell -NoProfile -File $statusGenScript 2>&1
-            $statusExit = $LASTEXITCODE
-            foreach ($line in $statusOut) { Write-Log "  [status] $line" }
-            if ($statusExit -ne 0) {
-                Write-Log "WARN: status generation exited $statusExit - continuing with existing file state."
-            }
-        } catch {
-            Write-Log "WARN: status generation threw: $($_.Exception.Message) - continuing."
-        }
-    } else {
-        Write-Log "WARN: status generator not found at $statusGenScript - skipping."
+    $stateGenScript = 'E:\KI\Hermes\scripts\rmk_daily_hermes_state.py'
+    $stateGenOut = & python $stateGenScript 2>&1
+    $stateGenExit = $LASTEXITCODE
+    foreach ($line in $stateGenOut) { Write-Log "  [hermes-state] $line" }
+    if ($stateGenExit -ne 0) {
+        Write-Log "SNAPSHOT_BLOCKED_STATE_GENERATION_FAILED"
+        Write-Log "state/daily/hermes-state.json generation failed (exit $stateGenExit). Aborting before staging - refusing to snapshot stale/partial state."
+        Write-Log "END (blocked: state generation failed)"
+        exit 9
     }
 
     # -----------------------------------------------------------------
