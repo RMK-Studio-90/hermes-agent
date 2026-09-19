@@ -234,8 +234,11 @@ try {
     #     snapshot run so a stale/missing state file is never staged as if
     #     it were current.
     # -----------------------------------------------------------------
-    $stateGenScript = 'E:\KI\Hermes\scripts\rmk_daily_hermes_state.py'
-    $stateGenOut = & python $stateGenScript 2>&1
+    #     The generator and the priority engine it imports are tracked in this
+    #     repository (scripts/rmk/); nothing outside the repo is executed.
+    $stateGenScript = Join-Path $RepoPath 'scripts\rmk\rmk_daily_hermes_state.py'
+    $stateOutFile   = Join-Path $RepoPath 'state\daily\hermes-state.json'
+    $stateGenOut = & python $stateGenScript --repo $RepoPath --out $stateOutFile 2>&1
     $stateGenExit = $LASTEXITCODE
     foreach ($line in $stateGenOut) { Write-Log "  [hermes-state] $line" }
     if ($stateGenExit -ne 0) {
