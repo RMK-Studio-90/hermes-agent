@@ -612,6 +612,28 @@ def reorder_fallback_chain(agent: Any, reason: Any = None) -> Optional[Dict[str,
         return None
 
 
+def failover_restart_limit(agent: Any, default: int) -> int:
+    """Per-turn bound on rebuilt-message restarts (turn_iteration_prep).
+
+    The historical bound is ``api_max_retries`` (same-route retries), which also
+    capped failover hops: with N healthy-looking candidates ahead of the first
+    reachable one (e.g. a whole subscription account rate-limited) the turn
+    died after ``default`` hops although eligible routes remained. Each
+    failover restart is armed by one *successful* activation of an entry of the
+    finite, router-built chain, so those hops are already bounded by the chain
+    (``_fallback_index`` only advances). With adaptive routing on, the limit
+    therefore grows by the activations spent this turn; non-failover restarts
+    (truncation, ...) keep the original bound. Flag off: unchanged.
+    """
+    if not adaptive_routing_enabled():
+        return default
+    try:
+        hops = int(getattr(agent, "_fallback_index", 0) or 0)
+    except (TypeError, ValueError):
+        return default
+    return default + max(0, hops)
+
+
 # -- richer facade (aux / graph seams, demo) ------------------------
 
 def plan_route(
