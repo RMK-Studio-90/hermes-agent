@@ -7,7 +7,7 @@
       "why": "viking_search currently fails with HTTP 400 'Unable to determine provider for model free-stack' — a model-routing config error blocking Hermes memory search."
     }
   ],
-  "date": "2026-09-19",
+  "date": "2026-09-20",
   "git": {
     "branch": "rmk/integration-current-upstream"
   },
