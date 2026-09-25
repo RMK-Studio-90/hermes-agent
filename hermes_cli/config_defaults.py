@@ -853,13 +853,16 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
-        "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
+        "proactive_prune_tokens": 48000,  # trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models
                                       # `threshold` (≈50% of the window) rarely fires,
                                       # so old tool output otherwise rides in history
-                                      # and is re-sent every turn; a low value like
-                                      # 48000 reclaims it early. 0 = off. Recent tail
+                                      # and is re-sent every turn; 48000 reclaims it
+                                      # early. Windows too small to reach it are
+                                      # handled by `threshold` alone. 0 = off. Must
+                                      # match agent.context_compressor.
+                                      # DEFAULT_PROACTIVE_PRUNE_TOKENS. Recent tail
                                       # protected by `protect_last_n`. Built-in
                                       # compressor only (other engines inherit a no-op).
                                       # NOTE: each committed prune rewrites already-sent
@@ -2092,6 +2095,12 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Toolsets a child does NOT inherit when delegate_task runs without an
+        # explicit toolsets list (the model-facing path). Both serve the
+        # parent's human-facing surface: text_to_speech talks to a user the
+        # child never sees, session_search recalls past conversations the
+        # parent should pass via `context` instead. [] = inherit everything.
+        "inherit_exclude_toolsets": ["tts", "session_search"],
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -2642,7 +2651,7 @@ DEFAULT_CONFIG = {
             "transport": "builtin",
             "transport_fallback": "deny",
         },
-        # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/
+        # Writes to agent-instruction files (.hermes.md/AGENTS.md/CLAUDE.md/SOUL.md/
         # .cursorrules, project-local .hermes config) always require human
         # approval — even under auto-approve/yolo. Extra patterns are
         # fnmatch globs matched against the basename (e.g. "*.mdc").

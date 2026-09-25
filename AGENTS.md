@@ -1120,32 +1120,37 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 
 ## Delegation (`delegate_task`)
 
-`tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. By default the parent waits for the
-child's summary before continuing its own loop. With `background=true`,
-Hermes returns a delegation id immediately and the result re-enters the
-conversation later through the async-delegation completion queue.
+`tools/delegate_tool.py` spawns subagents with an isolated
+context + terminal session. The model passes `tasks: [...]` (one entry =
+one subagent; several run in parallel, capped by
+`delegation.max_concurrent_children`, default 10). Top-level delegations
+always run in the background: dispatch returns immediately and one
+consolidated result re-enters the conversation when all children finish.
+A child's system prompt is a focused brief (goal + `context` + the
+workspace's project context files), never the parent's conversation;
+children run with `skip_memory=True`.
 
-Two shapes:
+Toolsets: there is no model-facing `toolsets` parameter. Children inherit
+the parent's enabled toolsets, minus `delegation.inherit_exclude_toolsets`
+(default `tts`, `session_search` — parent-surface tools a child has no
+use for) and minus the blocked tools below.
 
-- **Single:** pass `goal` (+ optional `context`, `toolsets`).
-- **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
-  running concurrently. Concurrency is capped by
-  `delegation.max_concurrent_children` (default 3).
+Roles are depth-derived, not caller-declared (the legacy `role` arg is
+ignored):
 
-Roles:
-
-- `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
-  `clarify`, `memory`, `send_message`, `cronjob`. Retains `execute_code`
-  (programmatic tool calling).
-- `role="orchestrator"` — retains `delegate_task` so it can spawn its
-  own workers. Gated by `delegation.orchestrator_enabled` (default true)
-  and bounded by `delegation.max_spawn_depth` (default 2).
+- **leaf** (default) — focused worker. Cannot call `delegate_task`,
+  `clarify`, `memory`, `send_message`, `cronjob`; kanban is stripped.
+  Retains `execute_code` (programmatic tool calling).
+- **orchestrator** — only when `delegation.orchestrator_enabled` (default
+  true) AND the child's depth is below `delegation.max_spawn_depth`
+  (default **1** = flat, so children are leaves unless raised; floor 1,
+  no ceiling).
 
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
-`max_iterations`.
+`inherit_exclude_toolsets`, `max_iterations`, `model`/`provider`
+(route children to a cheaper model), `reasoning_effort`.
 
 Durability rule: background `delegate_task` is detached from the current
 turn but still process-local. For work that must survive process restart, use
@@ -1208,14 +1213,17 @@ job B's prompt), `workdir` (run in a specific directory with its
 `AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery.
 
 Hardening invariants:
-- **3-minute hard interrupt** on cron sessions — runaway agent loops
-  cannot monopolize the scheduler.
+- **Inactivity timeout** on cron runs (default 600s without any tool
+  call, API call or stream delta; `HERMES_CRON_TIMEOUT`, 0 = unlimited) —
+  hung jobs cannot monopolize the scheduler, long active jobs still finish.
 - Catchup window: half the job's period, clamped to 120s–2h.
 - Grace window: 120s for one-shot jobs whose fire time was missed.
 - File lock at `~/.hermes/cron/.tick.lock` prevents duplicate ticks
   across processes.
-- Cron sessions pass `skip_memory=True` by default; memory providers
-  intentionally do not run during cron.
+- Cron agents run with memory enabled like every other agent
+  (`skip_memory=False`, since ef04d846e): MEMORY.md/USER.md load and the
+  memory tool follows normal toolset resolution. They skip the background
+  skill/memory review fork (`skip_background_review=True`).
 
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the

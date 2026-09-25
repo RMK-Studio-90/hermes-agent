@@ -1032,6 +1032,34 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+# Toolsets a child does NOT pick up when it inherits the parent's toolsets
+# implicitly (no explicit ``toolsets`` from the caller). Both serve the
+# parent's human-facing surface, not a delegated task: text_to_speech speaks
+# to a user the child never talks to (its only output is a summary for the
+# parent), and session_search recalls the user's past conversations, which
+# is exactly the context the parent is supposed to hand over explicitly via
+# ``context``. Each costs schema tokens on every child API call. An explicit
+# ``toolsets`` list from a direct caller is honored as-is.
+_DEFAULT_INHERIT_EXCLUDE_TOOLSETS = ("tts", "session_search")
+
+
+def _get_inherit_exclude_toolsets() -> List[str]:
+    """Toolsets stripped from implicitly inherited child toolsets.
+
+    Config key: ``delegation.inherit_exclude_toolsets`` (list). Unset → the
+    defaults above; an explicit empty list restores full inheritance.
+    """
+    cfg = _load_config()
+    raw = cfg.get("inherit_exclude_toolsets")
+    if raw is None:
+        return list(_DEFAULT_INHERIT_EXCLUDE_TOOLSETS)
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",")]
+    if not isinstance(raw, (list, tuple, set)):
+        return list(_DEFAULT_INHERIT_EXCLUDE_TOOLSETS)
+    return [str(name) for name in raw if str(name).strip()]
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1714,9 +1742,16 @@ def _build_child_agent(
         inherited_disabled = [
             name for name in inherited_disabled if name != "delegation"
         ]
+    # Implicit inheritance drops parent-surface toolsets (see
+    # _DEFAULT_INHERIT_EXCLUDE_TOOLSETS). Passed as deny toolsets so the
+    # subtraction also applies inside composite bundles (hermes-cli, ...).
+    inherit_excluded = [] if toolsets else _get_inherit_exclude_toolsets()
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            inherited_disabled
+            + _blocked_toolsets_for_role(effective_role)
+            + ["kanban"]
+            + inherit_excluded
         )
     )
 
@@ -3704,7 +3739,7 @@ def delegate_task(
     background = is_truthy_value(background, default=False) if background is not None else False
 
     # Depth limit — configurable via delegation.max_spawn_depth,
-    # default 2 for parity with the original MAX_DEPTH constant.
+    # default MAX_DEPTH (1 = flat: the top-level agent's children are leaves).
     depth = getattr(parent_agent, "_delegate_depth", 0)
     max_spawn = _get_max_spawn_depth()
     if depth >= max_spawn:
@@ -4822,6 +4857,8 @@ def _build_top_level_description() -> str:
         "DO NOT USE FOR (use these instead):\n"
         "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
         "- A single tool call -> call the tool directly\n"
+        "- Sequential steps where each needs the previous result -> do them "
+        "yourself, in order\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
         "terminal(background=True, notify=True); /stop, /new, or "
@@ -4960,7 +4997,7 @@ DELEGATE_TASK_SCHEMA = {
                     "required": ["goal"],
                 },
                 # No maxItems — the runtime limit is configurable via
-                # delegation.max_concurrent_children (default 3) and
+                # delegation.max_concurrent_children (default 10) and
                 # enforced with a clear error in delegate_task().
                 # NOTE: the handler also accepts a per-task `role` — legacy,
                 # ignored: delegation capability is depth-derived, not

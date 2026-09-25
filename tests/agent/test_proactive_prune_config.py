@@ -3,9 +3,9 @@
 Mirrors ``test_compression_max_attempts_config.py``: the three knobs are
 parsed in ``agent_init`` with the same hardened semantics (booleans rejected,
 fractional floats rejected — not truncated, integral floats and numeric
-strings accepted) and attached to the built-in compressor.  Default is
-0 / 8000 / 4096, i.e. the feature is OFF and behavior-neutral unless
-``proactive_prune_tokens`` is set above 0.
+strings accepted) and attached to the built-in compressor.  An unset
+trigger resolves to ``DEFAULT_PROACTIVE_PRUNE_TOKENS`` (the same value the
+TUI live-reload path restores); ``0`` turns the prune off.
 """
 
 from __future__ import annotations
@@ -59,12 +59,33 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
 
 
 class TestProactivePruneConfig:
-    def test_default_is_disabled_when_unset(self, monkeypatch, tmp_path):
+    def test_unset_resolves_to_shared_default(self, monkeypatch, tmp_path):
+        from agent.context_compressor import DEFAULT_PROACTIVE_PRUNE_TOKENS
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
         agent = _make_agent(monkeypatch, tmp_path)
         cc = agent.context_compressor
-        assert cc.proactive_prune_tokens == 0
+        assert cc.proactive_prune_tokens == DEFAULT_PROACTIVE_PRUNE_TOKENS > 0
+        # The documented config default and the unset fallback agree.
+        assert (
+            DEFAULT_CONFIG["compression"]["proactive_prune_tokens"]
+            == DEFAULT_PROACTIVE_PRUNE_TOKENS
+        )
         assert cc.proactive_prune_min_result_chars == 8000
         assert cc.proactive_prune_min_reclaim_tokens == 4096
+
+    def test_zero_disables(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=0)
+        assert agent.context_compressor.proactive_prune_tokens == 0
+
+    def test_null_resolves_to_default(self, monkeypatch, tmp_path):
+        from agent.context_compressor import DEFAULT_PROACTIVE_PRUNE_TOKENS
+
+        agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=None)
+        assert (
+            agent.context_compressor.proactive_prune_tokens
+            == DEFAULT_PROACTIVE_PRUNE_TOKENS
+        )
 
     def test_custom_values_are_honored(self, monkeypatch, tmp_path):
         agent = _make_agent(

@@ -425,7 +425,11 @@ class TestProtectedInstructionFiles:
     # ---- core behavior -------------------------------------------------
 
     @pytest.mark.parametrize(
-        "name", ["AGENTS.md", "CLAUDE.md", "SOUL.md", ".cursorrules"]
+        "name",
+        [
+            "AGENTS.md", "CLAUDE.md", "SOUL.md", ".cursorrules",
+            ".hermes.md", "HERMES.md", "AGENTS.override.md",
+        ],
     )
     def test_deny_blocks_write(self, tmp_path, approvals, name):
         target = tmp_path / name
@@ -689,3 +693,16 @@ class TestProtectedInstructionFiles:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_every_startup_context_filename_is_protected():
+    """Invariant: any filename the prompt builder or the subdirectory-hint
+    tracker loads as agent instructions must be write-protected."""
+    from agent.prompt_builder import _HERMES_MD_NAMES
+    from agent.subdirectory_hints import _HINT_FILENAMES
+    from tools.file_tools import _protected_instruction_reason
+
+    for name in (*_HERMES_MD_NAMES, *_HINT_FILENAMES):
+        assert _protected_instruction_reason(
+            f"/tmp/proj/{name}", enabled=True, extra_patterns=[]
+        ), name

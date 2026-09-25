@@ -735,6 +735,10 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules",
+    # .hermes.md / HERMES.md win project-context priority over everything
+    # above (agent/prompt_builder.py _HERMES_MD_NAMES); AGENTS.override.md
+    # is a subdirectory-hint file (agent/subdirectory_hints.py).
+    ".hermes.md", "hermes.md", "agents.override.md",
 })
 
 _real_hermes_home_cached: str | None = None

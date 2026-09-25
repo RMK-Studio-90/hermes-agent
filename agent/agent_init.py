@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import DEFAULT_PROACTIVE_PRUNE_TOKENS, ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -2224,11 +2224,19 @@ def init_agent(
         except (TypeError, ValueError):
             return default
 
-    # Opt-in proactive tool-result prune trigger (0 = disabled — the
-    # default, so an unset key is behavior-neutral).  Negative values are
-    # treated as disabled rather than erroring.
+    # Proactive tool-result prune trigger. An unset key resolves to
+    # DEFAULT_PROACTIVE_PRUNE_TOKENS (shared with the TUI live-reload path);
+    # 0 disables. Invalid values (bools, fractions, junk) and negatives fall
+    # back to disabled rather than erroring.
+    _raw_prune_tokens = _compression_cfg.get(
+        "proactive_prune_tokens", DEFAULT_PROACTIVE_PRUNE_TOKENS
+    )
     compression_proactive_prune_tokens = max(
-        0, _parse_prune_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
+        0,
+        _parse_prune_int(
+            DEFAULT_PROACTIVE_PRUNE_TOKENS if _raw_prune_tokens is None else _raw_prune_tokens,
+            0,
+        ),
     )
     compression_proactive_prune_min_chars = _parse_prune_int(
         _compression_cfg.get("proactive_prune_min_result_chars", 8000), 8000

@@ -289,6 +289,12 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
+# Default for config ``compression.proactive_prune_tokens`` when the key is
+# unset. Shared by agent construction (agent_init) and live config reload
+# (tui_gateway) so both resolve an absent key identically. The ctor default
+# below stays 0: a bare ContextCompressor (library use) never prunes unless
+# asked. Windows too small to reach the trigger fall back to ``threshold``.
+DEFAULT_PROACTIVE_PRUNE_TOKENS = 48_000
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (

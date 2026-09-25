@@ -297,3 +297,34 @@ class TestExcludedDirectories:
         assert result is not None
         assert "Personal backend override" in result
         assert "Committed backend rules" not in result
+
+
+class TestAncestorHermesMd:
+    """A .hermes.md in an ancestor wins startup priority over the cwd's own
+    AGENTS.md, so that AGENTS.md must stay lazily discoverable."""
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".hermes.md").write_text("Condensed root rules")
+        (tmp_path / "AGENTS.md").write_text("Full root guide")
+        app = tmp_path / "app"
+        (app / "src").mkdir(parents=True)
+        (app / "AGENTS.md").write_text("App-specific rules")
+        (app / "src" / "main.ts").write_text("export {}")
+        return tmp_path
+
+    def test_cwd_agents_md_loads_when_ancestor_hermes_md_won(self, repo):
+        tracker = SubdirectoryHintTracker(working_dir=str(repo / "app"))
+        result = tracker.check_tool_call("read_file", {"path": "src/main.ts"})
+        assert result is not None
+        assert "App-specific rules" in result
+        # Injected once only.
+        assert tracker.check_tool_call("read_file", {"path": "src/main.ts"}) is None
+
+    def test_hermes_md_dir_itself_stays_covered_by_startup(self, repo):
+        tracker = SubdirectoryHintTracker(working_dir=str(repo))
+        (repo / "lib").mkdir()
+        (repo / "lib" / "x.py").write_text("")
+        result = tracker.check_tool_call("read_file", {"path": "lib/x.py"})
+        assert result is None or "Full root guide" not in result

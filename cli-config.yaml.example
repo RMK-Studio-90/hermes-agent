@@ -684,7 +684,7 @@ compression:
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
 
-  # Proactive tool-result prune (default: 0 = disabled). Opt-in token trigger
+  # Proactive tool-result prune (default: 48000; 0 = disabled). Token trigger
   # for a deterministic, no-LLM prune of OLD tool-result payloads, run
   # independently of `threshold` above. On large-window models (512K/1M) the
   # ratio threshold rarely fires, so bulky tool outputs (terminal dumps, file
@@ -692,13 +692,13 @@ compression:
   # When re-sent history exceeds this many tokens, the prune dedupes identical
   # results, summarizes older oversized ones, and truncates large tool-call
   # arguments — protecting the most recent `protect_last_n` messages and never
-  # calling the model. Try 48000 to enable. Built-in compressor engine only;
+  # calling the model. Built-in compressor engine only;
   # other context engines inherit a safe no-op.
   # NOTE: a committed prune rewrites already-sent history, which invalidates
   # the provider's prompt-cache prefix — the min_reclaim gate below keeps
   # those cache breaks episodic (like a compression boundary) instead of
   # per-turn.
-  proactive_prune_tokens: 0
+  proactive_prune_tokens: 48000
 
   # The prune's summarize pass only touches tool results larger than this many
   # characters (clamped to >= 200 so a generated summary can't be

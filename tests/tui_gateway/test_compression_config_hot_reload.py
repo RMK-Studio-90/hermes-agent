@@ -164,12 +164,15 @@ def test_removing_protect_last_n_restores_default(monkeypatch):
 
 def test_removing_proactive_prune_keys_restores_defaults(monkeypatch):
     session, compressor = _neutral_session(
-        proactive_prune_tokens=48_000,
+        proactive_prune_tokens=12_345,
         proactive_prune_min_result_chars=30_000,
         proactive_prune_min_reclaim_tokens=1,
     )
     _sync_with_cfg(monkeypatch, session, {"compression": {}})
-    assert compressor.proactive_prune_tokens == 0
+    # Same resolution as agent construction for an unset key.
+    from agent.context_compressor import DEFAULT_PROACTIVE_PRUNE_TOKENS
+
+    assert compressor.proactive_prune_tokens == DEFAULT_PROACTIVE_PRUNE_TOKENS
     assert compressor.proactive_prune_min_result_chars == 8000
     assert compressor.proactive_prune_min_reclaim_tokens == 4096
 

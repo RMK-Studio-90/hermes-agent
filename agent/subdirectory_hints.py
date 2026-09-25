@@ -20,7 +20,7 @@ import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
-from agent.prompt_builder import _scan_context_content
+from agent.prompt_builder import _find_hermes_md, _scan_context_content
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +88,26 @@ class SubdirectoryHintTracker:
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
         self._loaded_digests: Set[str] = set()
-        # Pre-mark the working dir as loaded (startup context handles it)
-        self._loaded_dirs.add(self.working_dir)
-        self._seed_working_dir_digest()
+        # Pre-mark the working dir as loaded (startup context handles it) —
+        # unless a .hermes.md in an ANCESTOR won startup priority. That file
+        # replaced the project-context chain, so this directory's own
+        # AGENTS.md/CLAUDE.md was never loaded and must stay discoverable
+        # here (lazily, on first touch) instead of being silently dropped.
+        if not self._startup_context_from_ancestor_hermes_md():
+            self._loaded_dirs.add(self.working_dir)
+            self._seed_working_dir_digest()
+
+    def _startup_context_from_ancestor_hermes_md(self) -> bool:
+        try:
+            hermes_md = _find_hermes_md(self.working_dir)
+        except (OSError, ValueError, RuntimeError):
+            return False
+        if hermes_md is None:
+            return False
+        try:
+            return hermes_md.parent.resolve() != self.working_dir
+        except (OSError, RuntimeError):
+            return False
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.

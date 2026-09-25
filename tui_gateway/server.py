@@ -6681,10 +6681,14 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
             return
         setattr(cc, attr, max(min_value, value))
 
+    # Unset resolves like agent construction (agent_init), not like a bare
+    # ContextCompressor: the ctor default is 0 for library use.
+    from agent.context_compressor import DEFAULT_PROACTIVE_PRUNE_TOKENS
+
     _assign_int(
         "proactive_prune_tokens",
         "proactive_prune_tokens",
-        int(_compressor_ctor_default("proactive_prune_tokens", 0)),
+        DEFAULT_PROACTIVE_PRUNE_TOKENS,
     )
     _assign_int(
         "proactive_prune_min_result_chars",
