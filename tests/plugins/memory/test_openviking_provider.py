@@ -1621,6 +1621,7 @@ def test_prefetch_sends_contract_safe_memory_context_payload(monkeypatch):
                 "limit": 24,
                 "score_threshold": 0,
                 "context_type": "memory",
+                "filter": {"op": "must_not", "field": "search_tags", "conds": ["lifecycle=superseded"]},
             },
         )
     ]
@@ -1905,3 +1906,16 @@ class TestOpenVikingEnvWriter:
         assert env.read_text(encoding="utf-8").splitlines() == [
             "A=1", "OPENAI_API_KEY=new", "B=2",
         ]
+
+
+@pytest.mark.parametrize("session_id", ["", "sess-1"])
+def test_recall_request_excludes_superseded_versions_only(session_id):
+    sent = []
+    client = SimpleNamespace(post=lambda path, payload, timeout=None: sent.append(payload) or {"result": {}})
+    OpenVikingMemoryProvider._post_prefetch_search(
+        client, "query text", session_id, limit=5, context_type=["memory", "resource"],
+        deadline=__import__("time").monotonic() + 30, request_timeout=5)
+    flt = sent[0]["filter"]
+    assert flt["op"] == "must_not" and flt["field"] == "search_tags"
+    assert flt["conds"] == ["lifecycle=superseded"]
+    assert sent[0]["context_type"] == ["memory", "resource"]

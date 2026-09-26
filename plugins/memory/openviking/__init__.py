@@ -1569,7 +1569,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def _post_prefetch_search(cls, client: _VikingClient, query: str, session_id: str, *, limit: int,
                               context_type: str | List[str], deadline: float, request_timeout: float) -> dict:
         """Session-aware search first, falling back to search/find (budget errors propagate)."""
-        base_payload = {"query": query, "limit": limit, "score_threshold": 0, "context_type": context_type}
+        # Versioned resources stay stored for history; tagging an old version lifecycle=superseded keeps it
+        # out of automatic recall. Filtering server-side keeps old versions from crowding the candidate pool.
+        base_payload = {"query": query, "limit": limit, "score_threshold": 0, "context_type": context_type,
+                        "filter": {"op": "must_not", "field": "search_tags", "conds": ["lifecycle=superseded"]}}
         if session_id:
             try:
                 return client.post("/api/v1/search/search", {**base_payload, "session_id": session_id},
