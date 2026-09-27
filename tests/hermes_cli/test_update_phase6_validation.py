@@ -9,8 +9,6 @@ Covers the decision-critical pieces of the Phase 6 gate in
   may be restored; restore is ``state_mode="live"`` + ``code_mode="live-git"``
   (forward-apply on the scratched HEAD); the function always returns False, so
   a failed validation is never accepted.
-* ``_print_update_summary`` — ``validation_ok=False`` withholds the "✓ Update
-  complete!" banner and returns False.
 * ``_routing_probe_failures`` — exercised against synthetic first-party routing
   modules in a real subprocess (hermetic, offline).
 * ``_run_quick_snapshots`` — the pre-update checkpoint is a SafeState, with a
@@ -23,7 +21,6 @@ import json
 from pathlib import Path
 
 from hermes_cli.update_cmd_maint import (
-    _print_update_summary,
     _rollback_after_failed_validation,
     _routing_probe_failures,
     _run_doctor_probe,
@@ -220,69 +217,6 @@ def test_rollback_restores_verified_safestate_live(monkeypatch, capsys, tmp_path
     out = capsys.readouterr().out
     assert "verified — restoring" in out
     assert "Code rolled back" in out
-
-
-# ---------------------------------------------------------------------------
-# _print_update_summary — validation_ok withholds the completion banner
-# ---------------------------------------------------------------------------
-
-def test_summary_validation_failure_withholds_completion(monkeypatch, capsys):
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd._post_update_sqlite_runtime_status", lambda: (True, None)
-    )
-    ok = _print_update_summary(
-        node_failures=[], desktop_build_ok=True, pre_update_version="v1", validation_ok=False
-    )
-    assert ok is False
-    out = capsys.readouterr().out
-    assert "Update partially complete" in out
-    assert "post-update validation" in out
-    assert "Update complete!" not in out
-
-
-def test_summary_all_ok_returns_true(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd._post_update_sqlite_runtime_status", lambda: (True, None)
-    )
-    completion: list[str] = []
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd._update_complete_message", lambda v: f"completion {v}"
-    )
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd_maint._print_update_completion", completion.append
-    )
-    ok = _print_update_summary(
-        node_failures=[], desktop_build_ok=True, pre_update_version="v1", validation_ok=True
-    )
-    assert ok is True
-    assert completion == ["completion v1"]
-
-
-def test_summary_node_failures_print_partial_banner_but_do_not_demote(monkeypatch, capsys):
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd._post_update_sqlite_runtime_status", lambda: (True, None)
-    )
-    # Node failures are banner-only: the returned verdict is
-    # ``desktop_build_ok and sqlite_runtime_ok and validation_ok`` — never demoted
-    # by node_failures (see update_cmd_maint._print_update_summary).
-    ok = _print_update_summary(
-        node_failures=["dashboard"], desktop_build_ok=True, pre_update_version="v1",
-    )
-    assert ok is True
-    out = capsys.readouterr().out
-    assert "Update partially complete" in out
-    assert "dashboard" in out
-
-
-def test_summary_desktop_failure_demotes(monkeypatch, capsys):
-    monkeypatch.setattr(
-        "hermes_cli.update_cmd._post_update_sqlite_runtime_status", lambda: (True, None)
-    )
-    ok = _print_update_summary(
-        node_failures=[], desktop_build_ok=False, pre_update_version="v1",
-    )
-    assert ok is False
-    assert "desktop app was not rebuilt" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

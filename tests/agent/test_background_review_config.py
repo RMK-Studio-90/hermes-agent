@@ -18,7 +18,10 @@ BR_DEFAULTS = DEFAULT_CONFIG["auxiliary"]["background_review"]
 
 def test_shipped_defaults_carry_the_new_keys():
     assert BR_DEFAULTS["enabled"] is True
-    assert BR_DEFAULTS["max_input_tokens"] == 200_000  # was 600_000
+    # The budget is NOT frozen at a fixed shipped max_input_tokens anymore (600k, then RMK
+    # 200k): the resolver derives it from each fork's resolved context window (75% window,
+    # capped at 600k, 120k fallback), so the shipped defaults must NOT pin the value.
+    assert "max_input_tokens" not in BR_DEFAULTS
     assert BR_DEFAULTS["max_context_tokens"] == 0
     assert BR_DEFAULTS["max_iterations"] == 6
     assert BR_DEFAULTS["refine_max_input_tokens"] == 600_000
@@ -34,10 +37,26 @@ def test_skills_creation_nudge_interval_documented_at_current_value():
     assert DEFAULT_CONFIG["skills"]["creation_nudge_interval"] == 10
 
 
-def test_review_input_token_budget_default_is_200k():
+def test_review_input_token_budget_default_is_context_derived():
+    """The unset default is not a frozen 200k: without a resolved context window the budget
+    resolver falls back to a fixed-but-bounded _REVIEW_MAX_INPUT_TOKENS_FALLBACK (120k), and
+    with a fork context window it derives 75% of that window (capped at 600k) — never
+    unbounded. See test_background_review_config_does_not_freeze_a_fixed_input_budget /
+    test_review_input_token_budget_default_tracks_forks_context_window."""
     cfg = {"auxiliary": {"background_review": dict(BR_DEFAULTS)}}
     with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
-        assert br._review_input_token_budget() == 200_000
+        # No resolved window (no fork passed) -> bounded fallback, never the old 200k.
+        fallback = br._review_input_token_budget(None, None)
+        assert fallback == br._REVIEW_MAX_INPUT_TOKENS_FALLBACK
+        assert fallback > 0
+        # A fork with a 200k context window -> 75% of the window (150k), i.e. budget is
+        # determined by the current context-window resolver architecture.
+        from types import SimpleNamespace
+        fork = SimpleNamespace(context_compressor=SimpleNamespace(context_length=200_000))
+        assert br._review_input_token_budget(None, fork) == 150_000
+        # The historical cloud-scale ceiling still bounds context-derived budgets.
+        big_fork = SimpleNamespace(context_compressor=SimpleNamespace(context_length=2_000_000))
+        assert br._review_input_token_budget(None, big_fork) <= br._REVIEW_MAX_INPUT_TOKENS_CAP
 
 
 def test_review_input_token_budget_explicit_override():
