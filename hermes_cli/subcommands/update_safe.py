@@ -89,6 +89,66 @@ def run_update_safe(prod_root: Optional[Path] = None,
     return result
 
 
+def cmd_update_safe(args) -> int:
+    """CLI dispatch adapter: ``argparse.Namespace`` -> the programmatic guardian API.
+
+    The parser wires ``func=cmd_update_safe`` (see ``build_update_safe_parser``); the
+    dispatcher in ``hermes_cli/main.py`` always calls ``args.func(args)``, so this must
+    take the Namespace, not ``run_update_safe``'s own keyword arguments — that mismatch
+    was the original ``TypeError: ... not 'Namespace'`` crash.
+
+    ``--check`` stays lock-free and read-only, mirroring ``hermes update --check``
+    (``_update_preflight_handled`` in main.py bypasses the update lock the same way).
+    A real run shares the cross-process update marker with ``hermes update`` and the
+    Tauri updater (``hermes_cli.update_lock.UpdateLock``): the guardian only mutates the
+    production checkout for the certified ``git reset --hard`` promotion, but that window
+    still races a concurrent updater without the shared lock.
+
+    Fails CLOSED: any exception here — before, during, or after the guardian runs — is
+    reported as ``UPDATE_BLOCKED`` with a nonzero exit. There is no fallback to the
+    legacy ``hermes update`` path.
+    """
+    u = _safe()
+    run_dir = Path(args.run_dir) if args.run_dir else None
+
+    if args.check:
+        try:
+            result = run_update_safe(
+                prod_root=Path.cwd(), upstream_ref=args.branch,
+                check_only=True, run_dir=run_dir,
+            )
+        except Exception as exc:
+            print(f"hermes update-safe --check: ✗ UPDATE_BLOCKED (crashed before reporting a status: {exc})")
+            return 1
+        return 0 if result.get("status") != u.UPDATE_ABORTED else 1
+
+    from hermes_cli.update_lock import UPDATE_EXIT_CONCURRENT, UpdateLock, describe_holder
+
+    lock = UpdateLock()
+    if not lock.acquire():
+        print(describe_holder(lock.holder))
+        return UPDATE_EXIT_CONCURRENT
+
+    try:
+        result = run_update_safe(
+            prod_root=Path.cwd(), upstream_ref=args.branch,
+            check_only=False, promote=args.promote, run_dir=run_dir,
+        )
+    except Exception as exc:
+        print(f"hermes update-safe: ✗ UPDATE_BLOCKED (guardian crashed before reporting a status: {exc})")
+        return 1
+    finally:
+        lock.release()
+
+    return 0 if result.get("status") in (u.UPDATE_INSTALLED, "UP_TO_DATE") else 1
+
+
+# The parser default: a module-level alias so `build_update_safe_parser`'s own
+# `cmd_update_safe` PARAMETER (same name, intentionally — it's the override point)
+# doesn't shadow the real function when no override is passed.
+_DEFAULT_CMD_UPDATE_SAFE = cmd_update_safe
+
+
 def build_update_safe_parser(subparsers, *, cmd_update_safe: Optional[Callable] = None) -> None:
     """Attach the ``update-safe`` subcommand to ``subparsers``."""
     p = subparsers.add_parser(
@@ -108,4 +168,4 @@ def build_update_safe_parser(subparsers, *, cmd_update_safe: Optional[Callable] 
                    help="Upstream branch/ref to integrate (default: main).")
     p.add_argument("--run-dir", default=None, metavar="DIR",
                    help="Explicit report directory (default: <worktrees>/.hermes/update-runs/<ts>).")
-    p.set_defaults(func=run_update_safe)
+    p.set_defaults(func=cmd_update_safe or _DEFAULT_CMD_UPDATE_SAFE)
