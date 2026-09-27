@@ -302,16 +302,35 @@ def _live_system_guard(request, monkeypatch):
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
         low = cmd_str.lower()
-        if "update" in low and (
-            # hermes update / hermes update --gateway / setsid bash -c ... hermes update
-            ("hermes" in low and "update" in low.split())
-            or
-            # python -m hermes_cli.main update --gateway
-            ("hermes_cli" in low and "update" in low.split())
-            or
-            # venv/bin/hermes update  (absolute path variant used in tests)
-            (".venv/bin/hermes" in low and "update" in low)
-        ):
+        # For a direct argv list (the common shape: `subprocess.run(["git", ...])`,
+        # `subprocess.run([hermes_path, "update", ...])`), scan the REAL argv items
+        # instead of a naive join-then-split of the whole command line. Joining
+        # collapses a multi-word argument into indistinguishable whitespace
+        # tokens — a `git commit -m "BROKEN upstream update"` fixture commit
+        # (one argv item, the commit MESSAGE) was misread as a standalone
+        # `update` argument — and substring-matching "hermes" anywhere in the
+        # line false-positives on an unrelated path merely containing that
+        # substring (pytest's own `.../hermes-pytest/...` temp-dir base).
+        # A WRAPPER executable (setsid/bash -c "...") still gets whole-string
+        # scanning: its real command is shell text embedded in one argv item,
+        # which argv-item-exact-matching cannot see into.
+        if isinstance(cmd, (list, tuple)) and cmd:
+            argv_low = [str(a).lower() for a in cmd]
+            program = argv_low[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if program in _WRAPPER_COMMANDS:
+                hermes_update_blocked = "update" in low.split() and (
+                    "hermes" in low or "hermes_cli" in low
+                )
+            else:
+                args_low = argv_low[1:]
+                hermes_update_blocked = "update" in args_low and (
+                    "hermes" in program or any("hermes_cli" in a for a in args_low)
+                )
+        else:
+            hermes_update_blocked = "update" in low.split() and (
+                "hermes" in low or "hermes_cli" in low or ".venv/bin/hermes" in low
+            )
+        if hermes_update_blocked:
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "

@@ -305,3 +305,122 @@ def test_run_report_schema_contains_spec_fields(fake_repos):
     assert "baseline_diff" in rp["steps"]
     # safestate snapshot exists on disk
     assert (f["work"] / "runs" / "t6" / "safestate.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch (P0 fix): `args.func(args)` -> cmd_update_safe(args), not the
+# programmatic `run_update_safe(**kwargs)` API directly. The parser-only test
+# above (`test_cli_parser_exposes_update_safe_and_check`) never caught this —
+# it builds `args` but never calls `args.func(args)`.
+# ---------------------------------------------------------------------------
+
+def _cli_args(*, check=False, promote=True, branch="main", run_dir=None):
+    import argparse
+    return argparse.Namespace(check=check, promote=promote, branch=branch, run_dir=run_dir)
+
+
+def test_cli_dispatch_through_real_parser_and_func_no_typeerror(fake_repos, monkeypatch):
+    """Reproduces the original crash: build the REAL parser, resolve `args.func`,
+    and call it with the Namespace argparse hands it — not with kwargs."""
+    import argparse
+    from hermes_cli.subcommands.update_safe import build_update_safe_parser
+
+    f = fake_repos
+    monkeypatch.chdir(f["prod"])
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    build_update_safe_parser(sub)  # no override -> must default to a working adapter
+    args = parser.parse_args(["update-safe", "--check", "--branch", "main"])
+
+    rc = args.func(args)  # <- this line raised TypeError before the fix
+
+    assert isinstance(rc, int)
+    assert rc == 0
+    assert f["git"](f["prod"], "rev-parse", "HEAD") == f["prod_head"], "read-only --check must never move HEAD"
+
+
+def test_cli_check_real_subprocess_end_to_end(fake_repos):
+    """Acceptance A+B: a REAL `python -m hermes_cli.main update-safe --check`
+    subprocess, through the real argparse parser and dispatcher — not a direct
+    call to `run_update_safe`. Exit 0, no traceback, prod HEAD unchanged."""
+    f = fake_repos
+    home = f["work"] / "fake-home"
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, HERMES_HOME=str(home), PYTHONPATH=sys_path)
+
+    r = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "update-safe", "--check", "--branch", "main"],
+        cwd=str(f["prod"]), env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120,
+    )
+
+    combined = r.stdout + r.stderr
+    assert "Traceback" not in combined, combined
+    assert "TypeError" not in combined, combined
+    assert r.returncode == 0, combined
+    assert f["git"](f["prod"], "rev-parse", "HEAD") == f["prod_head"]
+
+
+def test_cmd_update_safe_fails_closed_never_falls_back_to_legacy_update(fake_repos, monkeypatch):
+    """Negative test (D): a crashed guardian must report failure and MUST NOT
+    fall back to legacy `hermes update`. Proven structurally: the legacy
+    entrypoint is patched to raise if it is ever reached from this path."""
+    import hermes_cli.subcommands.update_safe as mod
+
+    f = fake_repos
+    monkeypatch.chdir(f["prod"])
+
+    def boom(**kwargs):
+        raise RuntimeError("isolated worktree could not be created")
+
+    monkeypatch.setattr(mod, "run_update_safe", boom)
+
+    def legacy_forbidden(*_a, **_kw):
+        raise AssertionError("cmd_update_safe must never fall back to legacy hermes update")
+
+    # If a fallback existed it would reach hermes_cli.main.cmd_update; make
+    # that path explode instead of silently running.
+    import hermes_cli.main as main_mod
+    monkeypatch.setattr(main_mod, "cmd_update", legacy_forbidden, raising=False)
+
+    rc = mod.cmd_update_safe(_cli_args(check=False))
+
+    assert rc != 0, "a crashed guardian must be reported as a failure (UPDATE_BLOCKED)"
+    assert f["git"](f["prod"], "rev-parse", "HEAD") == f["prod_head"], "prod must stay untouched on crash"
+
+
+def test_cmd_update_safe_check_maps_needs_review_to_clean_exit(fake_repos, monkeypatch):
+    """--check reports UPDATE_NEEDS_REVIEW as informational, not a crash: exit 0
+    (matching the real production result observed live), but a genuine ABORTED
+    check (e.g. the check itself threw) still returns nonzero."""
+    import hermes_cli.subcommands.update_safe as mod
+    from hermes_cli import update_safe as u
+
+    f = fake_repos
+    monkeypatch.chdir(f["prod"])
+
+    monkeypatch.setattr(mod, "run_update_safe", lambda **kw: {"status": u.UPDATE_NEEDS_REVIEW})
+    assert mod.cmd_update_safe(_cli_args(check=True)) == 0
+
+    monkeypatch.setattr(mod, "run_update_safe", lambda **kw: {"status": u.UPDATE_ABORTED})
+    assert mod.cmd_update_safe(_cli_args(check=True)) != 0
+
+
+def test_cmd_update_safe_full_run_exit_code_matches_final_status(fake_repos, monkeypatch):
+    """The full (non-check) adapter path maps UPDATE_INSTALLED -> 0 and every
+    other terminal status (NEEDS_REVIEW / ABORTED / ROLLED_BACK) -> nonzero, so
+    a GUI driver can treat "nonzero" as UPDATE_BLOCKED uniformly."""
+    import hermes_cli.subcommands.update_safe as mod
+
+    f = fake_repos
+    monkeypatch.chdir(f["prod"])
+
+    for status, expect_zero in (
+        ("UPDATE_INSTALLED", True),
+        ("UPDATE_NEEDS_REVIEW", False),
+        ("UPDATE_ABORTED", False),
+        ("UPDATE_ROLLED_BACK", False),
+    ):
+        monkeypatch.setattr(mod, "run_update_safe", lambda **kw: {"status": status})
+        rc = mod.cmd_update_safe(_cli_args(check=False))
+        assert (rc == 0) is expect_zero, (status, rc)
