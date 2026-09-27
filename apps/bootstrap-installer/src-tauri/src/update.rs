@@ -3,10 +3,25 @@
 //! Driven when the installer is launched as `Hermes-Setup.exe --update` (see
 //! `AppMode` in lib.rs). The desktop app hands off to us — it exits, then we:
 //!
-//! Application output locks protect replacement. Python owns dependency
-//! generations, product compilation, and gateway draining/restart. Only a
-//! pre-PM runtime gets the historical extra rebuild/retry. Published launchers
-//! bind every command to the installation; user-bin migration verifies identity
+//!   1. wait for the old Hermes desktop process to fully exit (so both the
+//!      venv shim and packaged app.asar are free),
+//!   2. run `hermes update-safe --branch <branch>` — the CERTIFIED Safe Update
+//!      Guardian (hermes_cli/update_safe.py): isolated worktree -> merge ->
+//!      certify (git hygiene + python compile + regression + RMK contracts +
+//!      baseline diff) -> promote only on UPDATE_CERTIFIED -> post-promotion
+//!      smoke -> auto-rollback to last known good on smoke failure. This file
+//!      drives the EXISTING Python guardian as a subprocess; it is not
+//!      reimplemented here, and there is no fallback to a direct legacy
+//!      `hermes update` on any guardian failure (fail-closed: a nonzero exit
+//!      always means the production checkout was left unchanged),
+//!   3. run `hermes desktop --build-only` — the guardian is git-level only
+//!      and never composes Node/desktop products itself, so this ALWAYS runs
+//!      now (previously skipped for PM-era installs, back when `hermes
+//!      update` composed products internally),
+//!   4. launch the freshly-built desktop (reuses bootstrap::launch logic).
+//!
+//! Application output locks protect replacement. Published launchers bind
+//! every command to the installation; user-bin migration verifies identity
 //! through the existing `--version` surface before selecting an older launcher.
 
 use std::collections::VecDeque;
@@ -268,6 +283,34 @@ impl Drop for UpdateMarkerGuard {
     }
 }
 
+/// Command-line arguments for the certified Safe-Update-Guardian stage
+/// (`hermes update-safe --branch <branch>`). Extracted so the GUI/installer
+/// contract — "Update now" launches the guardian, never a direct legacy
+/// `hermes update` — is unit-testable without spawning a process.
+///
+/// Deliberately NOT included: `--force`, `--yes`, `--gateway`. Those exist
+/// only on legacy `hermes update` to bypass ITS Windows running-process /
+/// venv-holder guards while it mutates the live venv/app.asar in place. The
+/// guardian never touches the venv or the packaged desktop build during
+/// certification — it works in an isolated git worktree and only
+/// `git reset --hard`s the production checkout's git-TRACKED files at the
+/// certified promotion step; neither the venv nor the packaged app are
+/// git-tracked, so the guards those flags bypass do not apply here.
+fn update_stage_command_args(branch: &str) -> Vec<String> {
+    vec!["update-safe".into(), "--branch".into(), branch.into()]
+}
+
+/// Whether an exit-2 from the update stage is really the concurrent-update
+/// refusal, as opposed to an unrelated exit-2 (argparse's "invalid choice"
+/// for an install too old to have `update-safe` yet uses the same code).
+/// The refusal always prints its own `✗ ...` block to STDOUT
+/// (`hermes_cli.update_lock.describe_holder`); an argparse usage error goes
+/// to stderr and leaves `stdout_tail` without that marker.
+fn is_concurrent_update_refusal(exit_code: Option<i32>, stdout_tail: &[String]) -> bool {
+    exit_code == Some(UPDATE_EXIT_CONCURRENT)
+        && stdout_tail.iter().any(|l| l.trim_start().starts_with('✗'))
+}
+
 async fn run_update(app: AppHandle) -> Result<()> {
     let hermes_home = crate::paths::hermes_home();
     let install_root = hermes_home.join("hermes-agent");
@@ -361,28 +404,30 @@ async fn run_update(app: AppHandle) -> Result<()> {
         None,
     );
 
-    // ---- stage 2: hermes update -----------------------------------------
-    // Pass --branch so `hermes update` targets the branch this installer was
+    // ---- stage 2: hermes update-safe (Safe Update Guardian) --------------
+    // "Update now" must run the CERTIFIED path, never a direct legacy
+    // `hermes update`: isolated worktree -> merge -> certify (git hygiene +
+    // python compile + regression + RMK contracts + baseline diff) ->
+    // promote only on UPDATE_CERTIFIED -> post-promotion smoke -> auto-rollback
+    // on smoke failure. See hermes_cli/update_safe.py; this stage drives the
+    // EXISTING Python guardian as a subprocess — no second implementation
+    // here.
+    //
+    // Pass --branch so the guardian targets the branch this installer was
     // built/pinned against (BUILD_PIN_BRANCH), NOT its built-in default of
     // `main`. The install was a detached-HEAD checkout of a specific commit;
-    // without --branch, `hermes update` switches the checkout to `main` (a
-    // divergent branch that may not even have the desktop CLI command), then
-    // reports "already up to date" against the wrong branch. The desktop
+    // without --branch, the guardian would merge `main` (a divergent branch
+    // that may not even have the desktop CLI command) into it. The desktop
     // detected the update against this same branch, so we must update against
     // it too.
     emit_log(
         &app,
         Some("update"),
         LogStream::Stdout,
-        &format!("[update] updating against branch {update_branch}"),
+        &format!("[update] certifying against branch {update_branch}"),
     );
     let child_env = update_child_env(&install_root);
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
-    // Only historical in-place updaters need the old shim bypass.
-    if legacy_install { update_args.push("--force".into()); }
-    update_args.push("--branch".into());
-    update_args.push(update_branch);
+    let update_args: Vec<String> = update_stage_command_args(&update_branch);
 
     emit_stage(&app, "update", StageState::Running, None, None);
     let started = Instant::now();
@@ -396,38 +441,6 @@ async fn run_update(app: AppHandle) -> Result<()> {
     )
     .await?;
 
-    // Retry-once for the update-boundary crash. `hermes update` lazily imports
-    // the FRESHLY PULLED modules, but the dependency-install step still runs the
-    // already-in-memory pre-pull code for one invocation. A release that changed
-    // an updater-path contract across that boundary (e.g. #39780's `_UvResult`,
-    // whose `__iter__` injected a bool into the argv and crashed Windows
-    // `list2cmdline` with `TypeError: sequence item 1: expected str instance,
-    // bool found`, fixed in #39820) therefore kills the FIRST update on the
-    // parked population — even though the fix is already on disk by then. A
-    // second `hermes update` runs clean because the now-current module is loaded
-    // from the start. Rather than make the parked user click Update twice (and
-    // stare at a scary crash first), retry once automatically. Skip the retry
-    // for the concurrent-instance guard (exit 2) — that's a "close Hermes" state
-    // a retry can't fix.
-    if legacy_install && !matches!(update.exit_code, Some(0) | Some(UPDATE_EXIT_CONCURRENT)) {
-        emit_log(
-            &app,
-            Some("update"),
-            LogStream::Stdout,
-            "[update] first update attempt failed; retrying once (the fix it just \
-             pulled loads on the second run)…",
-        );
-        update = run_streamed(
-            &app,
-            &hermes,
-            &update_args,
-            &install_root,
-            &child_env,
-            Some("update"),
-        )
-        .await?;
-    }
-
     // Self-owned-marker heal (#75788). Exit 2 means the child refused over a
     // live update marker with a foreign owner. When that "foreign" owner is
     // THIS process, the child simply failed to recognize the handoff — a
@@ -439,6 +452,9 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // IS the update: drop our claim and retry once with the marker absent.
     // The guard re-removes on Drop (idempotent), and the desktop is already
     // gone at this point, so nothing races the brief marker-free window.
+    // `cmd_update_safe` (hermes_cli/subcommands/update_safe.py) shares the
+    // SAME `hermes_cli.update_lock.UpdateLock` marker as legacy `hermes
+    // update`, so this heal applies unchanged to the guardian too.
     if legacy_install && should_heal_self_marker_refusal(
         update.exit_code,
         &crate::paths::update_in_progress_marker(),
@@ -468,7 +484,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         Some(0) => {
             emit_stage(&app, "update", StageState::Succeeded, Some(update_ms), None);
         }
-        Some(code) if code == UPDATE_EXIT_CONCURRENT => {
+        Some(code) if is_concurrent_update_refusal(Some(code), &update.stdout_tail) => {
             let msg = concurrent_update_message(&update.stdout_tail);
             emit_stage(
                 &app,
@@ -487,8 +503,15 @@ async fn run_update(app: AppHandle) -> Result<()> {
             return Err(anyhow!(msg));
         }
         other => {
+            // FAIL-CLOSED, no exceptions: whatever the cause — certification
+            // gate failure, an install too old to have `update-safe` yet, a
+            // crashed guardian, an unrelated exit code — the guardian never
+            // mutates the production checkout before UPDATE_CERTIFIED, so a
+            // nonzero exit here always means the checkout is UNCHANGED.
+            // There is no fallback to legacy `hermes update`.
             let msg = format!(
-                "hermes update failed (exit {:?}). See {} for details.",
+                "Safe Update Guardian blocked this update (exit {:?}); the production \
+                 checkout was left unchanged. See {} for details.",
                 other,
                 crate::paths::hermes_home()
                     .join("logs")
@@ -513,9 +536,13 @@ async fn run_update(app: AppHandle) -> Result<()> {
         }
     }
 
-    // Older updaters did not own desktop compilation. Current PM update
-    // composes all products and propagates failures; never build them twice.
-    if legacy_install {
+    // update-safe is git-level only (isolated worktree -> merge -> certify ->
+    // promote); unlike the modern PM-era `hermes update` it never composes
+    // Node/desktop products itself. This stage always runs now, regardless
+    // of install generation (the previous `legacy_install`-only gate matched
+    // the old "does `hermes update` already compose products" question,
+    // which no longer applies once "update" always means the guardian).
+    {
         emit_stage(&app, "rebuild", StageState::Running, None, None);
         let started = Instant::now();
         let rebuild_args: Vec<String> = vec!["desktop".into(), "--build-only".into()];
@@ -526,9 +553,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         // repaired mid-run. A second attempt then builds clean off the healed dist
         // (the content-hash stamp makes it a near-no-op when the first actually
         // succeeded). Without this the updater bails here and never reaches the
-        // relaunch below — the app updates but doesn't restart. Matches the
-        // retry-once `hermes update` already does above, and `hermes update`'s own
-        // desktop rebuild in cmd_update.
+        // relaunch below — the app updates but doesn't restart.
         if rebuild_needs_retry(rebuild.exit_code) {
             emit_log(
                 &app,
@@ -573,8 +598,6 @@ async fn run_update(app: AppHandle) -> Result<()> {
             return Err(anyhow!(msg));
         }
         emit_stage(&app, "rebuild", StageState::Succeeded, Some(rebuild_ms), None);
-    } else {
-        emit_stage(&app, "rebuild", StageState::Succeeded, Some(0), None);
     }
 
     let launch_target = if let Some(target_app) = target_app {
@@ -1140,7 +1163,7 @@ fn stage_info(name: &str, title: &str) -> StageInfo {
 fn update_stages(include_install: bool) -> Vec<StageInfo> {
     let mut stages = vec![
         stage_info("handoff", "Preparing to update"),
-        stage_info("update", "Downloading the latest version"),
+        stage_info("update", "Certifying the update"),
         stage_info("rebuild", "Rebuilding the desktop app"),
     ];
     if include_install {
@@ -1280,6 +1303,56 @@ mod tests {
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn update_stage_launches_the_guardian_not_legacy_update() {
+        // Contract test C: "Update now" must start `update-safe`, never a
+        // direct `hermes update`.
+        let args = update_stage_command_args("main");
+        assert_eq!(args[0], "update-safe", "must dispatch to the certified guardian");
+        assert_ne!(args[0], "update", "must never call legacy `hermes update` directly");
+        assert_eq!(args, vec!["update-safe", "--branch", "main"]);
+    }
+
+    #[test]
+    fn update_stage_args_never_carry_the_legacy_venv_bypass_flags() {
+        // --force/--yes/--gateway exist only for legacy `hermes update`'s
+        // live-venv mutation guards; the guardian never touches the venv
+        // during certification (isolated worktree) and doesn't accept them.
+        let args = update_stage_command_args("rmk/integration-current-upstream");
+        for flag in ["--force", "--yes", "--gateway"] {
+            assert!(!args.contains(&flag.to_string()), "unexpected {flag} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn concurrent_refusal_requires_the_printed_marker_not_just_exit_2() {
+        // An install too old to have `update-safe` fails with argparse's
+        // "invalid choice" exit 2, printed to STDERR — stdout_tail stays
+        // empty of the `✗` refusal block. That must NOT be misclassified as
+        // "another update is running": it is UPDATE_BLOCKED with no fallback.
+        assert!(!is_concurrent_update_refusal(Some(UPDATE_EXIT_CONCURRENT), &[]));
+        assert!(!is_concurrent_update_refusal(
+            Some(UPDATE_EXIT_CONCURRENT),
+            &lines("usage: hermes [-h] ...\n")
+        ));
+    }
+
+    #[test]
+    fn concurrent_refusal_recognized_when_the_child_prints_its_block() {
+        let tail = lines(
+            "✗ Another Hermes update is already running (started 3m 42s ago, process 65285).\n",
+        );
+        assert!(is_concurrent_update_refusal(Some(UPDATE_EXIT_CONCURRENT), &tail));
+    }
+
+    #[test]
+    fn concurrent_refusal_false_for_unrelated_exit_codes() {
+        let tail = lines("✗ Another Hermes update is already running.\n");
+        assert!(!is_concurrent_update_refusal(Some(0), &tail));
+        assert!(!is_concurrent_update_refusal(Some(1), &tail));
+        assert!(!is_concurrent_update_refusal(None, &tail));
     }
 
     #[test]
