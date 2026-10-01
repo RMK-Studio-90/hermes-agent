@@ -136,7 +136,9 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): UpdaterStrat
       return { ok: false, error: status.error ?? status.reason, message: status.message }
     }
 
-    const branch: string = status.branch ?? deps.defaultUpdateBranch
+    // A local-only branch is updated in place from `updateBranch` (main); passing the
+    // local branch name would make `hermes update` look for it on origin and fail.
+    const branch: string = status.updateBranch ?? status.branch ?? deps.defaultUpdateBranch
     const targetArgs: string[] = status.channel ? ['--channel', status.channel] : ['--branch', branch]
     const targetLabel: string = status.channel ?? branch
 

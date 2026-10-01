@@ -342,8 +342,13 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 
+def _updates_in_place(branch: str, config: dict) -> bool:
+    """True when ``hermes update`` merges origin/main into ``branch`` instead of leaving it (mirrors update_cmd)."""
+    return branch.startswith("rmk/") or (config.get("updates") or {}).get("parked_branch_strategy") == "update_in_place"
+
+
 def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
-                  heal: Optional[tuple[Path, dict]]) -> None:
+                  heal: Optional[tuple[Path, dict]], in_place: bool = False) -> None:
     """Compare the checkout with ``selected_branch``'s remote tip, falling back to main if it was deleted."""
     result["branch"] = selected_branch
     remote = _branch_remote(co, selected_branch)
@@ -352,6 +357,21 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
     if reason:
         detail = ("has never been pushed" if reason == "never-pushed"
                   else "is gone from the remote but has commits that are not in main")
+        if in_place:
+            # The updater merges origin/main into this branch, so main is the comparison target:
+            # the local-only branch is neither an error nor a reason to switch away from it.
+            target, _, failure = _branch_tip(co.repository, "main", co.root, co.git,
+                                             remote if co.embedded else "origin")
+            if target is None:
+                result.update(error="fetch-failed",
+                              message=f"Could not resolve the remote branch tip: {failure}" if failure
+                              else "Could not resolve the remote branch tip.")
+                return
+            behind, commits = _behind_count(co, target)
+            result.update(localOnly=True, updateBranch="main", commits=commits, targetSha=target,
+                          behind=behind, updateAvailable=behind != 0,
+                          notice=f"Branch '{selected_branch}' {detail}; updating it in place from main.")
+            return
         result.update(error="branch-local-only", localOnly=True,
                       message=f"Branch '{selected_branch}' {detail}; keeping it instead of switching to main.")
         return
@@ -426,7 +446,8 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
         # Only a Desktop-configured branch the caller did not override is healed.
         heal = branch_config_path and not branch and configured_branch == selected_branch
         _check_branch(result, co, selected_branch,
-                      heal=(branch_config_path, desktop_config) if heal else None)
+                      heal=(branch_config_path, desktop_config) if heal else None,
+                      in_place=_updates_in_place(selected_branch, config))
     _write_cache(cache_file, identity, now, result)
     return result
 

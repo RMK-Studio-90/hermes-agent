@@ -95,6 +95,17 @@ function ordinaryUpdateStatus({ apply, checking, status, target, u }: UpdateStat
   }
 
   if (status?.error) {
+    // branch-local-only is a valid state (branch not on remote), not a connection failure.
+    // Show the backend's explanatory message instead of the generic "can't reach server".
+    if (status.error === 'branch-local-only' && status.message) {
+      return {
+        applying,
+        line: status.message,
+        supported,
+        tone: 'error',
+        updateAvailable
+      }
+    }
     return {
       applying,
       error: [status.message, status.error].filter(l => !!l).join('\n'),

@@ -51,6 +51,11 @@ export interface UpdaterStatusWire {
   mechanism?: UpdaterMechanism
   updateAvailable?: boolean
   branch?: string
+  /** Remote branch `hermes update` pulls from when it differs from `branch` (local-only RMK branch updates in place from main). */
+  updateBranch?: string
+  /** Informational note that is not a failure (e.g. branch kept and updated in place). */
+  notice?: string
+  localOnly?: boolean
   currentBranch?: string
   reason?: string
   message?: string

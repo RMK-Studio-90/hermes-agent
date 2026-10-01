@@ -382,6 +382,23 @@ def test_never_pushed_branch_keeps_its_pin(installation, pinned_by):
     assert requests == [MAIN_CHANNEL]
 
 
+def test_local_only_rmk_branch_updates_in_place_from_main(installation):
+    """An rmk/* branch absent from the remote is compared with main, never reported as a failure."""
+    from hermes_cli.source_check import check_for_updates
+    root, linked, home, base, head, responses, requests, git = installation
+    _bare_origin(installation)
+    git("branch", "rmk/integration")
+    _commit_on(git, "rmk/integration", "rmk customisation")
+    git("checkout", "-q", "rmk/integration")
+    status = check_for_updates(install_root=root, home=home)
+    assert "error" not in status, status
+    assert status["branch"] == "rmk/integration"
+    assert status["updateBranch"] == "main"
+    assert status["localOnly"] is True
+    assert status["targetSha"] == git("rev-parse", "origin/main")
+    assert git("rev-parse", "--abbrev-ref", "HEAD") == "rmk/integration"
+
+
 @pytest.mark.parametrize("merge", ["fast-forward", "rebase", "unmerged"])
 def test_deleted_remote_branch_heals_only_when_its_commits_are_in_main(installation, merge):
     from hermes_cli.source_check import check_for_updates

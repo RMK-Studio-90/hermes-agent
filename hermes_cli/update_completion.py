@@ -9,6 +9,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import platform
 import signal
 from pathlib import Path
 import subprocess
@@ -151,6 +152,24 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
             # This file runs from the new tree, so its lockfile carries the new
             # pins; tools (incl. bumped uv/python) land before the sync uses them.
             ensure_tools_for_sync()
+            # Stop any other venv holder processes (excluding the current one) to avoid
+            # locking issues when updating the virtual environment on Windows.
+            if platform.system() == "Windows":
+                try:
+                    from hermes_cli.update_cmd_windows import _detect_venv_python_processes
+                    current_pid = os.getpid()
+                    venv_holders = _detect_venv_python_processes(exclude_pids={current_pid})
+                    for pid, name, cmdline in venv_holders:
+                        try:
+                            # Use taskkill to stop the process
+                            subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                        except Exception:
+                            pass
+                except Exception:
+                    # If we can't import or detect, we continue anyway.
+                    pass
             # An update never fails because of a plugin: misfits are disabled and reported.
             pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
             collect_superseded_generations(root)
