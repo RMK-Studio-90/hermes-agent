@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
-from agent.skill_commands import SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
+from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
 
@@ -57,12 +57,26 @@ def escape_like(text: str) -> str:
 
 
 _PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
-_PREVIEW_SCAFFOLDED_SQL = f"m.content LIKE '{SKILL_SCAFFOLD_SQL_LIKE}'"
+# User-invoked and gateway auto-load scaffolds both get the head+tail excerpt window:
+# the typed request sits at the tail (auto-load) or behind the instruction marker.
+# No LIKE wildcards in either prefix, so no ESCAPE clause is needed.
+_PREVIEW_SCAFFOLDED_SQL = (
+    f"(m.content LIKE '{SKILL_SCAFFOLD_SQL_LIKE}'"
+    f" OR m.content LIKE '{AUTO_LOAD_SCAFFOLD_SQL_LIKE}')")
 _SQL_WHITESPACE = "CHAR(9) || CHAR(10) || CHAR(13) || CHAR(32)"
 
 
 def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
+
+
+# ``display_metadata`` flag stamped on the user row a busy-queue accept writes (#111868/#121374
+# accept-time durability). The in-memory queue drain re-places an unmarked row at the transcript
+# end and deactivates this one; a backend restart discards the queue with nothing left to retire
+# the accept-time row, so ``reopen_session`` deactivates still-marked rows (#125577) — the marker
+# is exactly what distinguishes a never-drained accept row from a dispatched-then-interrupted
+# turn's row (which #123532 deliberately keeps active).
+QUEUED_PROMPT_METADATA_KEY = "_queued_prompt"
 
 
 def _sql_json_extract(expression: str, path: str) -> str:
@@ -260,7 +274,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 31
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -362,6 +376,7 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
+    created_source TEXT,
     user_id TEXT,
     session_key TEXT,
     chat_id TEXT,
@@ -416,6 +431,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     transport_profile TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    auto_archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
@@ -450,7 +466,11 @@ CREATE TABLE IF NOT EXISTS messages (
     display_kind TEXT,
     display_metadata TEXT,
     display_identity BLOB,
-    display_order INTEGER
+    display_order INTEGER,
+    message_uid TEXT,
+    absorbed_message_uids TEXT,
+    tool_call_uids TEXT,
+    tool_call_uid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -473,27 +493,6 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     first_seen REAL,
     last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
-);
-
-
-CREATE TABLE IF NOT EXISTS routing_telemetry (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    turn_index INTEGER NOT NULL,
-    task_requirements TEXT NOT NULL,  -- JSON
-    candidates TEXT NOT NULL,         -- JSON array of objects with model, provider
-    rejection_reasons TEXT NOT NULL,  -- JSON object mapping model:provider to reason
-    selected_provider TEXT NOT NULL,
-    selected_model TEXT NOT NULL,
-    free_paid_route TEXT NOT NULL,    -- 'free' or 'paid'
-    fallback_attempts INTEGER NOT NULL DEFAULT 0,
-    final_model_used TEXT NOT NULL,
-    latency REAL NOT NULL,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    failure_classification TEXT,
-    final_outcome TEXT NOT NULL,
-    timestamp REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -604,35 +603,6 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
--- One row per completed background memory/skill review fork (agent/background_review.py).
--- Counters + enums only; NO conversation text, tool payloads, or memory/skill bodies.
--- The fork runs detached (_session_db=None); this row is written against the PARENT session's
--- DB at fork completion. Coarser than logs (which stay), finer than session_model_usage
--- (which has no outcome). Never garbage-collected with the session — soft session_id link.
-CREATE TABLE IF NOT EXISTS background_review_event (
-    event_id           TEXT PRIMARY KEY,
-    ts                 REAL NOT NULL,
-    session_id         TEXT,
-    profile            TEXT,
-    source             TEXT,
-    trigger            TEXT,
-    outcome            TEXT NOT NULL,
-    provider           TEXT,
-    model              TEXT,
-    routed             INTEGER NOT NULL DEFAULT 0,
-    context_strategy   TEXT,
-    provider_calls     INTEGER NOT NULL DEFAULT 0,
-    input_tokens       INTEGER NOT NULL DEFAULT 0,
-    output_tokens      INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
-    duration_ms        INTEGER NOT NULL DEFAULT 0,
-    wrote_memory       INTEGER NOT NULL DEFAULT 0,
-    wrote_skill        INTEGER NOT NULL DEFAULT 0,
-    reason_code        TEXT,
-    error_code         TEXT,
-    backoff_multiplier INTEGER NOT NULL DEFAULT 1
-);
-
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -653,8 +623,6 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-CREATE INDEX IF NOT EXISTS idx_bre_session ON background_review_event(session_id);
-CREATE INDEX IF NOT EXISTS idx_bre_ts ON background_review_event(ts);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
@@ -670,6 +638,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_display_backfill
 CREATE INDEX IF NOT EXISTS idx_messages_display_identity
     ON messages(session_id, display_identity, display_order)
     WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1);
+DROP TRIGGER IF EXISTS messages_message_uid_insert;
+CREATE TRIGGER IF NOT EXISTS messages_message_uid_insert
+AFTER INSERT ON messages WHEN new.message_uid IS NULL
+BEGIN
+    -- Every row carries a message_uid, whoever wrote it: a build that predates the column binds NULL, so
+    -- the store mints one on its behalf (the current build always binds a uid; this never fires for it).
+    -- The note lives inside the body: a comment before DROP/CREATE would defeat the settled-trigger skip.
+    UPDATE messages SET message_uid = lower(hex(randomblob(16))) WHERE id = new.id;
+END;
 DROP TRIGGER IF EXISTS messages_display_order_insert;
 CREATE TRIGGER IF NOT EXISTS messages_display_order_insert
 AFTER INSERT ON messages WHEN new.display_order IS NULL
@@ -1326,3 +1303,12 @@ def fts_rebuild_admission(db_path, *, timeout_seconds=None):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+
+def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
+    """``json.loads(raw)``; on failure log *warning* and return *fallback*."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(warning)
+        return fallback

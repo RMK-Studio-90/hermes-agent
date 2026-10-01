@@ -19,25 +19,13 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
-            "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
-            "manual_model_pin": copy.deepcopy(
-                getattr(agent, "_routing_manual_model_override", None)),
-            "routing_explicit_model": getattr(agent, "_routing_explicit_model", False)}
+            "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
-    def _restore_pin() -> None:
-        from agent.routing.integration import clear_manual_model_pin, set_manual_model_pin
-        pin = snapshot.get("manual_model_pin")
-        if pin:
-            set_manual_model_pin(agent, pin[0], pin[1])
-        else:
-            clear_manual_model_pin(agent)
-            agent._routing_explicit_model = bool(snapshot.get("routing_explicit_model", False))
-
     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
     if "reasoning_config" in snapshot:
@@ -49,7 +37,6 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
-                _restore_pin()
                 if "reasoning_config" in snapshot:
                     agent.reasoning_config = snapshot["reasoning_config"]
                 return
@@ -62,7 +49,6 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_mode=api_mode, capabilities=snapshot.get("capabilities"))
         if "reasoning_config" in snapshot:
             agent.reasoning_config = snapshot["reasoning_config"]
-    _restore_pin()
 
 
 def _profile_runtime_scope_tokens(profile_home, *, hydrate_secrets: bool = True) -> "_TurnScopes":
@@ -230,6 +216,20 @@ def _current_model_runtime(agent, explicit_provider: str) -> tuple:
     return provider, current_model, str(runtime.get("base_url", "") or ""), key
 
 
+def _switch_away_provider(agent, explicit_provider: str, current_provider: str) -> str | None:
+    """The provider of the model the user leaves. Agent-less with ``--provider``, ``current_provider``
+    is the TARGET (what switch_model wants), so the launch route names it instead; None when only a
+    credential resolve could tell, which the metric reads as ``unknown`` and so reports the model as
+    ``custom``."""
+    if agent or not explicit_provider:
+        return current_provider
+    if env_provider := os.environ.get("HERMES_TUI_PROVIDER", "").strip():
+        return env_provider
+    if _env_model_seed():
+        return None
+    return _config_model_target()[1] or None
+
+
 def _merge_preflight_warning(result, agent, session: dict, cfg, custom_provs) -> None:
     """Fold the context-compression preflight warning into ``result`` (best-effort)."""
     try:
@@ -264,10 +264,7 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
     return {"value": result.new_model, "warning": msg, "confirm_required": True, "confirm_message": msg}
 
 
-def _commit_agent_switch(
-    sid: str, session: dict, agent, result, current_model: str, snapshot,
-    *, manual_selection: bool,
-):
+def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
     try:
         agent.switch_model(
@@ -284,9 +281,6 @@ def _commit_agent_switch(
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
-    if manual_selection:
-        from agent.routing.integration import set_manual_model_pin
-        set_manual_model_pin(agent, result.target_provider, result.new_model)
     _restart_slash_worker(sid, session)
     _persist_live_session_runtime(session)
     _persist_live_session_system_prompt(session)
@@ -301,7 +295,9 @@ def _commit_agent_switch(
 def _apply_model_switch(
     sid: str, session: dict, raw_input: str, *, confirm_expensive_model: bool = False,
     pin_session_override: bool = True, parsed_flags: Any | None = None,
-    persist_override: bool | None = None, manual_selection: bool = False) -> dict:
+    persist_override: bool | None = None, count_switch: bool = True) -> dict:
+    """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
+    user's /model pick, so it stays out of the shared-metrics switch count."""
     from hermes_cli.model_switch import switch_model
     model_input, explicit_provider, one_turn, persist_global, reasoning_effort = _switch_request(
         raw_input, parsed_flags, persist_override)
@@ -344,9 +340,7 @@ def _apply_model_switch(
     try:
         if agent:
             # Provenance must exist before this transaction persists the switched runtime.
-            _commit_agent_switch(
-                sid, session, agent, result, current_model, restore_snapshot,
-                manual_selection=manual_selection)
+            _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
     except Exception:
         if records_composer_override:
             if had_composer_profile:
@@ -360,15 +354,19 @@ def _apply_model_switch(
     if pin_session_override and isinstance(session, dict) and not one_turn:
         session["model_override"] = {
             "model": result.new_model, "provider": result.target_provider,
-            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode,
-            **({"manual_model_pin": {
-                "provider": result.target_provider, "model": result.new_model,
-            }} if manual_selection else {})}
+            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
     if persist_global:
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)
     if reasoning_effort:
         _apply_switch_reasoning(sid, session, agent, reasoning_effort, persist_global=persist_global, one_turn=one_turn)
+    if count_switch:
+        from hermes_cli.observability.shared_metrics_events import record_model_switch
+
+        record_model_switch(
+            from_provider=_switch_away_provider(agent, explicit_provider, current_provider),
+            to_provider=result.target_provider, surface=_session_source(session), from_model=current_model,
+            session_id=getattr(agent, "session_id", None))
     return {
         "value": result.new_model, "warning": result.warning_message or "",
         "confirm_required": False,
@@ -476,7 +474,7 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         # how `hermes --tui -m` once leaked into config.yaml).
         _apply_model_switch(
             sid, session, raw, confirm_expensive_model=True, pin_session_override=False,
-            persist_override=False)
+            persist_override=False, count_switch=False)
     except Exception as e:
         logger.warning("Configured model %s could not be adopted for session %s: %s", model, sid, e)
         from gateway.warning_notifications import render_notification
