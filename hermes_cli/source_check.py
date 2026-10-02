@@ -141,9 +141,31 @@ def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
                 remote: str = "origin") -> tuple[str | None, bool, str | None]:
     """``(sha, missing, failure)``: ``missing`` only on a confirmed empty advertisement;
     ``failure`` names why no tip could be read, for the user-facing message."""
-    # A successful empty ref advertisement alone proves a branch was deleted.
-    # GitHub 404 can also mean a private repository: it must not heal a branch.
-    failure = None
+    # First try git ls-remote (preferred for local branches)
+    result = _git_run(["ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"],
+                      cwd=root, git=git, timeout=10)
+    if result is None:
+        # git ls-remote failed to run
+        return None, False, f"`git ls-remote {remote}` could not run."
+
+    sha = result.stdout.split()[0] if result.returncode == 0 and result.stdout else None
+    if _is_full_sha(sha):
+        # Successfully got SHA from git ls-remote
+        return sha, False, None
+
+    if result.returncode == 2:
+        # Branch doesn't exist on remote
+        return None, True, None
+
+    # git ls-remote ran but didn't give us a SHA (and it's not a "missing branch" case)
+    git_failure = None
+    detail = (result.stderr or "").strip().splitlines()
+    if detail:
+        git_failure = f"`git ls-remote {remote}` failed: {detail[-1]}"
+    else:
+        git_failure = f"`git ls-remote {remote}` returned no tip."
+
+    # Only fall back to GitHub API if git ls-remote didn't give us a SHA and we have a repository
     if repository:
         from hermes_cli.github_api import describe_github_failure, github_token
         try:
@@ -156,20 +178,11 @@ def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
             return sha, False, None
         if failure is None:
             failure = "api.github.com returned no commit for the branch."
-        if branch == "main" and remote == "origin":
-            return None, False, failure
-    result = _git_run(["ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"],
-                      cwd=root, git=git, timeout=10)
-    if result is None:
-        return None, False, failure or f"`git ls-remote {remote}` could not run."
-    sha = result.stdout.split()[0] if result.returncode == 0 and result.stdout else None
-    if _is_full_sha(sha):
-        return sha, False, None
-    if result.returncode == 2:
-        return None, True, None
-    detail = (result.stderr or "").strip().splitlines()
-    return None, False, failure or (f"`git ls-remote {remote}` failed: {detail[-1]}" if detail
-                                    else f"`git ls-remote {remote}` returned no tip.")
+        # If both methods failed, prefer the git failure for local branch context
+        return None, False, failure or git_failure
+
+    # If we got here, git ls-remote didn't work and we have no repository to fall back to
+    return None, False, git_failure
 
 
 def _commits(payload: dict | None) -> list[dict]:
