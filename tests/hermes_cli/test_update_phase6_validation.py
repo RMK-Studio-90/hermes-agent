@@ -223,6 +223,37 @@ def test_rollback_restores_verified_safestate_live(monkeypatch, capsys, tmp_path
 # _run_quick_snapshots — SafeState checkpoint with legacy fallback
 # ---------------------------------------------------------------------------
 
+def test_live_git_rollback_resets_head_when_tree_was_clean(tmp_path):
+    """A failed update on a clean checkout must really move the code back to the recorded HEAD."""
+    import subprocess
+
+    from hermes_cli.rmk_safestate import create_safestate, restore_safestate
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    root, home = tmp_path / "code", tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    (home / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (root / "app.py").write_text("good\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    good_head = git("rev-parse", "HEAD")
+    snap = create_safestate(label="pre-update", hermes_home=home, code_root=root)["snap_id"]
+
+    (root / "app.py").write_text("broken update\n", encoding="utf-8")
+    git("commit", "-qam", "pulled upstream")
+    result = restore_safestate(snap, hermes_home=home, code_root=root, state_mode="live", code_mode="live-git")
+
+    assert result["code_result"]["success"] is True
+    assert git("rev-parse", "HEAD") == good_head
+    assert (root / "app.py").read_text(encoding="utf-8").replace("\r\n", "\n") == "good\n"
+
+
 def test_quick_snapshots_uses_safestate_not_legacy(monkeypatch, capsys):
     captured: dict = {}
     monkeypatch.setattr(

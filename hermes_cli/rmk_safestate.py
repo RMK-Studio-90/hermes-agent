@@ -702,7 +702,11 @@ def restore_safestate(
             try:
                 gh = json.loads(git_head_path.read_text(encoding="utf-8"))
                 patch_text = patch_path.read_text(encoding="utf-8")
-                if patch_text.strip() and root:
+                if code_mode == "live-git" and root and gh.get("head_sha") and not patch_text.strip():
+                    # Clean tree at checkpoint: nothing to forward-apply, but a failed update
+                    # must still be moved back to the recorded HEAD (never report a no-op as rolled back).
+                    code_result = _restore_code_live_git(str(root), gh, patch_text)
+                elif patch_text.strip() and root:
                     # Never write code on an unverifiable patch: prove restorability in the
                     # scratch worktree FIRST; live-git then applies the same mechanics to the
                     # real checkout (reset --hard to the recorded head, forward-apply patch).
@@ -752,6 +756,10 @@ def _restore_code_live_git(code_root: str, gh: Dict[str, Any], patch_text: str) 
         if reset.returncode != 0:
             return {"success": False, "mode": "live-git",
                     "detail": f"git reset --hard {head_sha} failed: {(reset.stderr or '').strip()[:200]}",
+                    "head_sha": head_sha}
+        if not patch_text.strip():
+            return {"success": True, "mode": "live-git",
+                    "detail": f"reset to {head_sha[:12]} (clean tree at checkpoint, no patch)",
                     "head_sha": head_sha}
         apply_r = subprocess.run(
             ["git", "-C", code_root, "apply", "--ignore-whitespace", "--"],
